@@ -22,6 +22,7 @@ def main() -> None:
     screenshot = Path(os.environ.get("REVIEW_SCREENSHOT", "/tmp/dataset-image-review.png"))
     expect_setup = os.environ.get("REVIEW_EXPECT_SETUP") == "1"
     setup_config = os.environ.get("REVIEW_SETUP_CONFIG")
+    project_config = os.environ.get("REVIEW_PROJECT_CONFIG")
     verify_delivery = os.environ.get("REVIEW_VERIFY_DELIVERY") == "1"
     expect_no_visual = os.environ.get("REVIEW_EXPECT_NO_VISUAL") == "1"
     with sync_playwright() as playwright:
@@ -33,7 +34,30 @@ def main() -> None:
             expect(page.locator("#reviewUi")).to_be_hidden()
             expect(page.locator("[data-directory='visual_root']")).to_have_count(1)
             expect(page.locator("#configure")).to_have_count(1)
-            if setup_config:
+            if project_config:
+                config = json.loads(project_config)
+                page.evaluate(
+                    """config => {
+                        document.getElementById("dataRoot").value = config.data_root;
+                        document.getElementById("workspaceRoot").value = config.workspace_root || "";
+                        document.getElementById("companyName").value = config.company;
+                        document.getElementById("projectName").value = config.project;
+                        document.getElementById("visualRoot").value = config.visual_root || "";
+                        document.getElementById("labelRoot").value = config.label_root || "";
+                    }""",
+                    config,
+                )
+                page.locator("#scanProject").click()
+                expect(page.locator("#projectCategories")).to_contain_text(config["category"])
+                page.locator(f"[data-project-category='{config['category']}']").click()
+                expect(page.locator("#reviewUi")).to_be_visible()
+                expect(page.locator("#stats")).to_contain_text("总图片")
+                if config.get("visual_root"):
+                    expect(page.locator("#visualStage img")).to_have_count(1)
+                expect(page.locator("#info")).to_contain_text(
+                    f"{config['company']} / {config['project']} / {config['category']}"
+                )
+            elif setup_config:
                 page.evaluate(
                     """config => {
                         document.getElementById("visualRoot").value = config.visual_root || "";
@@ -48,7 +72,9 @@ def main() -> None:
             page.screenshot(path=str(screenshot), full_page=True)
             assert screenshot.is_file() and screenshot.stat().st_size > 0
             browser.close()
-            result = "browser_setup_configure_smoke" if setup_config else "browser_setup_smoke"
+            result = "browser_project_setup_smoke" if project_config else (
+                "browser_setup_configure_smoke" if setup_config else "browser_setup_smoke"
+            )
             print(f"{result}=ok screenshot={screenshot}")
             return
         expect(page.locator("#stats")).to_contain_text("总图片")

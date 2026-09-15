@@ -25,6 +25,14 @@
 Windows 与多数 macOS Python 通常已包含；Ubuntu 如提示缺少，请安装与当前 Python
 对应的 `python3-tk`。无桌面或没有 `tkinter` 的环境可使用下面的兼容配置模式。
 
+## 项目工作台
+
+如果硬盘数据按分类组织，例如 `/data/现场项目/分类A`、`/data/现场项目/分类B`、
+`/data/现场项目/分类C`，启动后可在网页的“项目工作台”中选择数据根目录，填写公司和项目，
+点击“扫描项目分类”，再点击分类卡片开始处理。工具会为每个分类单独保存审核状态和导出结果；
+审核状态变化后项目清单会刷新，已修改但未重新导出的分类会标记为“导出过期”。
+默认工作区位于数据根目录同级；不要把工作区放进原始数据目录。
+
 ## JSON 配置（兼容模式）
 
 将 `config.example.json` 复制为 `config.json`，填写必填的 `original_root`、`output_root`；
@@ -91,13 +99,13 @@ Ubuntu / macOS：
 
 ```bash
 cd /path/to/the/zip-directory
-sha256sum -c dataset-image-review-portable-1.3.0.zip.sha256
+sha256sum -c dataset-image-review-portable-1.4.0.zip.sha256
 ```
 
 Windows PowerShell：
 
 ```powershell
-(Get-FileHash .\dataset-image-review-portable-1.3.0.zip -Algorithm SHA256).Hash
+(Get-FileHash .\dataset-image-review-portable-1.4.0.zip -Algorithm SHA256).Hash
 ```
 
 将 PowerShell 输出与 `.sha256` 文件中的哈希值比较。

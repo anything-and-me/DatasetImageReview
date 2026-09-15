@@ -7,3 +7,16 @@ config.json
 Thumbs.db
 output/
 review-export/
+*_dataset_review_projects/
+project_manifest.json
+.review_state.json
+preflight_report.json
+export_summary.json
+review_manifest.jsonl
+annotation_guide/
+images/
+labels/
+visualizations/
+coco/
+cvat/
+label_studio/

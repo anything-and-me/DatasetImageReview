@@ -18,9 +18,18 @@ try:
         ReviewStore,
         export_dataset,
         run_preflight,
+        scan_project_categories,
     )
 except ModuleNotFoundError:
-    from app import PairingEngine, ReviewApplication, ReviewServer, ReviewStore, export_dataset, run_preflight
+    from app import (
+        PairingEngine,
+        ReviewApplication,
+        ReviewServer,
+        ReviewStore,
+        export_dataset,
+        run_preflight,
+        scan_project_categories,
+    )
 
 
 def write_file(path: Path, data: bytes = b"image") -> None:
@@ -466,6 +475,17 @@ class WebSetupTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "必须提供模型可视化图"):
                 application.configure_from_directories(None, original, output, candidate_only=True)
 
+    def test_web_configuration_requires_at_least_one_supported_original_image(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            original = root / "original"
+            output = root / "export"
+            (original / "notes").mkdir(parents=True)
+            (original / "notes" / "readme.txt").write_text("not an image", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "原图文件夹必须至少包含一张"):
+                ReviewApplication().configure_from_directories(None, original, output)
+
     def test_web_configure_endpoint_initializes_the_reviewer(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -522,6 +542,176 @@ class WebSetupTests(unittest.TestCase):
                 self.assertEqual(response.status, 200)
                 self.assertTrue(payload["ready"])
                 self.assertEqual(len(payload["records"]), 1)
+            finally:
+                connection.close()
+                stop.set()
+                server.server_close()
+                worker.join(timeout=5)
+
+
+class ProjectWorkspaceTests(unittest.TestCase):
+    def test_project_scan_discovers_company_project_categories_and_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data_root = root / "data" / "现场项目"
+            workspace = root / "workspace"
+            write_image(data_root / "分类A" / "g1.jpg")
+            write_image(data_root / "分类B" / "bin" / "b1.jpg")
+            write_image(data_root / "分类C" / "car.jpg")
+            write_file(data_root / "说明" / "note.txt", b"not images")
+            garbage_output = workspace / "示例公司" / "现场数据项目" / "categories" / "分类A"
+            ReviewStore(garbage_output / ".review_state.json").set_decision("sample-1", "keep")
+
+            payload = scan_project_categories(data_root, "示例公司", "现场数据项目", workspace)
+
+            self.assertEqual(payload["company"], "示例公司")
+            self.assertEqual(payload["project"], "现场数据项目")
+            categories = {item["name"]: item for item in payload["categories"]}
+            self.assertEqual(sorted(categories), ["分类A", "分类B", "分类C"])
+            self.assertEqual(categories["分类A"]["image_count"], 1)
+            self.assertEqual(categories["分类A"]["state"], "in_review")
+            self.assertEqual(categories["分类A"]["keep"], 1)
+            self.assertEqual(categories["分类B"]["state"], "pending")
+
+    def test_project_scan_rejects_category_slug_collision(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data_root = root / "data" / "现场项目"
+            write_image(data_root / "a b" / "one.jpg")
+            write_image(data_root / "a?b" / "two.jpg")
+
+            with self.assertRaisesRegex(ValueError, "项目分类名称冲突"):
+                scan_project_categories(data_root, "示例公司", "现场数据项目", root / "workspace")
+
+    def test_project_workspace_cannot_overlap_source_data(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data_root = root / "data" / "现场项目"
+            write_image(data_root / "分类A" / "g1.jpg")
+
+            with self.assertRaisesRegex(ValueError, "项目工作区不能与原始数据根目录"):
+                scan_project_categories(data_root, "示例公司", "现场数据项目", data_root / "_workspace")
+
+    def test_project_category_opens_the_existing_reviewer_without_touching_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data_root = root / "data" / "现场项目"
+            workspace = root / "workspace"
+            write_image(data_root / "分类A" / "scene" / "frame.jpg", (20, 30, 40))
+            write_image(data_root / "分类A" / "dataset-image-review" / "should_ignore.jpg")
+            source_digest = hashlib.sha256((data_root / "分类A" / "scene" / "frame.jpg").read_bytes()).hexdigest()
+            application = ReviewApplication()
+
+            application.configure_from_project_category(data_root, "示例公司", "现场数据项目", "分类A", workspace)
+            payload = application.state_payload()
+
+            self.assertTrue(payload["ready"])
+            self.assertEqual(payload["project"]["company"], "示例公司")
+            self.assertEqual(payload["project"]["project"], "现场数据项目")
+            self.assertEqual(payload["project"]["category"], "分类A")
+            self.assertEqual(len(payload["records"]), 1)
+            self.assertEqual(payload["records"][0]["original_rel"], "scene/frame.jpg")
+            self.assertIn("/workspace/示例公司/现场数据项目/categories/分类A", payload["config"]["output_root"])
+            self.assertEqual(
+                hashlib.sha256((data_root / "分类A" / "scene" / "frame.jpg").read_bytes()).hexdigest(),
+                source_digest,
+            )
+
+    def test_project_export_state_becomes_stale_after_decision_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data_root = root / "data" / "现场项目"
+            workspace = root / "workspace"
+            write_image(data_root / "分类A" / "frame.jpg")
+            application = ReviewApplication()
+            application.configure_from_project_category(data_root, "示例公司", "现场数据项目", "分类A", workspace)
+            application.set_decision(application.records[0].sample_id, "keep")
+            export_dataset(application.records, application.store, application.output_root)
+
+            exported = scan_project_categories(data_root, "示例公司", "现场数据项目", workspace)
+            self.assertEqual(exported["categories"][0]["state"], "exported")
+            application.set_decision(application.records[0].sample_id, "reject")
+            stale = scan_project_categories(data_root, "示例公司", "现场数据项目", workspace)
+            self.assertEqual(stale["categories"][0]["state"], "export_stale")
+
+    def test_project_decision_refreshes_manifest_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data_root = root / "data" / "现场项目"
+            workspace = root / "workspace"
+            write_image(data_root / "分类A" / "frame.jpg")
+            application = ReviewApplication()
+            application.configure_from_project_category(data_root, "示例公司", "现场数据项目", "分类A", workspace)
+            sample_id = application.records[0].sample_id
+            application.set_decision(sample_id, "keep")
+
+            manifest = json.loads(
+                (workspace / "示例公司" / "现场数据项目" / "project_manifest.json").read_text(encoding="utf-8")
+            )
+            category = manifest["categories"][0]
+            self.assertEqual(category["state"], "in_review")
+            self.assertEqual(category["keep"], 1)
+
+    def test_project_scan_and_open_http_endpoints(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data_root = root / "data" / "现场项目"
+            workspace = root / "workspace"
+            write_image(data_root / "分类D" / "frame.jpg")
+            visual_root = root / "visual"
+            write_image(visual_root / "frame.jpg", (20, 40, 60))
+            label_root = root / "labels"
+            write_file(label_root / "frame.txt", b"0 0.5 0.5 0.2 0.2\n")
+            server = ReviewServer(("127.0.0.1", 0), ReviewApplication())
+            server.timeout = 0.05
+            stop = threading.Event()
+
+            def serve_project_requests() -> None:
+                while not stop.is_set():
+                    server.handle_request()
+
+            worker = threading.Thread(target=serve_project_requests, daemon=True)
+            worker.start()
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+            try:
+                request = {
+                    "data_root": str(data_root),
+                    "workspace_root": str(workspace),
+                    "company": "示例公司",
+                    "project": "现场数据项目",
+                    "visual_root": str(visual_root),
+                    "label_root": str(label_root),
+                    "persist": True,
+                }
+                connection.request(
+                    "POST",
+                    "/api/project/scan",
+                    body=json.dumps(request),
+                    headers={"Content-Type": "application/json"},
+                )
+                response = connection.getresponse()
+                payload = json.loads(response.read())
+                self.assertEqual(response.status, 200)
+                self.assertEqual(payload["categories"][0]["name"], "分类D")
+                self.assertTrue((workspace / "示例公司" / "现场数据项目" / "project_manifest.json").is_file())
+
+                request["category"] = "分类D"
+                connection.request(
+                    "POST",
+                    "/api/project/open",
+                    body=json.dumps(request),
+                    headers={"Content-Type": "application/json"},
+                )
+                response = connection.getresponse()
+                payload = json.loads(response.read())
+                self.assertEqual(response.status, 200)
+                self.assertTrue(payload["ready"])
+                self.assertEqual(payload["project"]["category"], "分类D")
+                self.assertEqual(len(payload["records"]), 1)
+                self.assertEqual(payload["config"]["visual_root"], str(visual_root.resolve()))
+                self.assertEqual(payload["config"]["label_root"], str(label_root.resolve()))
+                self.assertEqual(payload["records"][0]["visual_rel"], "frame.jpg")
+                self.assertEqual(payload["records"][0]["label_rel"], "frame.txt")
             finally:
                 connection.close()
                 stop.set()

@@ -1,5 +1,5 @@
 {
-  "visual_root": "path/to/visualizations",
+  "visual_root": null,
   "original_root": "path/to/originals",
   "label_root": null,
   "output_root": "path/to/review-export",

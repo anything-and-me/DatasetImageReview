@@ -34,7 +34,18 @@ IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
 DECISIONS = {"keep", "reject", "skip"}
 DECISION_LABELS = {"keep": "保留", "reject": "不保留", "skip": "跳过", None: "未审核"}
 EXPORT_FORMATS = {"yolo", "coco", "cvat", "label_studio"}
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
+PROJECT_META_FILE = "project_manifest.json"
+PROJECT_WORKSPACE_DIR = "_dataset_review_projects"
+PROJECT_SCAN_IGNORED_DIRS = {
+    ".git",
+    ".venv",
+    "__pycache__",
+    PROJECT_WORKSPACE_DIR,
+    "dataset-image-review",
+    "dataset_image_review",
+}
+PROJECT_IMAGE_SCAN_LIMIT = 20_000
 
 
 def utc_now() -> str:
@@ -43,6 +54,26 @@ def utc_now() -> str:
 
 def canonical_path(path: Path) -> Path:
     return path.expanduser().resolve()
+
+
+def safe_slug(value: str) -> str:
+    """Keep human-readable Chinese names while removing path separators."""
+    cleaned = "".join(
+        character if character.isalnum() or character in {"-", "_", "."} else "_"
+        for character in value.strip()
+    ).strip("._-")
+    return cleaned or "project"
+
+
+def decision_fingerprint(decisions: dict[str, str]) -> str:
+    """Return a stable fingerprint for the current review decisions."""
+    normalized = {
+        str(sample_id): str(decision)
+        for sample_id, decision in decisions.items()
+        if decision in DECISIONS
+    }
+    encoded = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def is_inside(path: Path, root: Path) -> bool:
@@ -67,7 +98,7 @@ def validate_input_roots(
     """Validate the local-only input contract before state or exports are written."""
     if not original_root.is_dir():
         raise ValueError(f"原图文件夹不存在或不是目录: {original_root}")
-    if not image_files(original_root):
+    if not has_image_file(original_root):
         raise ValueError("原图文件夹必须至少包含一张 .jpg、.jpeg 或 .png 图片")
     if visual_root is not None and not visual_root.is_dir():
         raise ValueError(f"模型可视化图文件夹不存在或不是目录: {visual_root}")
@@ -94,14 +125,238 @@ def relative_posix(path: Path | None, root: Path | None) -> str | None:
         return path.name
 
 
-def image_files(root: Path) -> list[Path]:
+def image_files(root: Path, ignored_dirs: Iterable[str] | None = None) -> list[Path]:
     if not root.is_dir():
         return []
-    return sorted(
-        path
-        for path in root.rglob("*")
-        if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
-    )
+    ignored = set(ignored_dirs or ())
+    files: list[Path] = []
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                ordered_entries = sorted(entries, key=lambda entry: entry.name, reverse=True)
+                for entry in ordered_entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            if entry.name not in ignored:
+                                stack.append(Path(entry.path))
+                        elif entry.is_file(follow_symlinks=False) and Path(entry.name).suffix.lower() in IMAGE_SUFFIXES:
+                            files.append(Path(entry.path))
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return sorted(files)
+
+
+def has_image_file(root: Path) -> bool:
+    """Return quickly when a tree contains at least one supported image."""
+    if not root.is_dir():
+        return False
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            if entry.name not in PROJECT_SCAN_IGNORED_DIRS:
+                                stack.append(Path(entry.path))
+                        elif entry.is_file(follow_symlinks=False) and Path(entry.name).suffix.lower() in IMAGE_SUFFIXES:
+                            return True
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return False
+
+
+def count_images_bounded(root: Path, limit: int = PROJECT_IMAGE_SCAN_LIMIT) -> tuple[int, bool]:
+    """Count images without letting huge现场数据 trees block the project dashboard."""
+    count = 0
+    truncated = False
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            if entry.name not in PROJECT_SCAN_IGNORED_DIRS:
+                                stack.append(Path(entry.path))
+                        elif entry.is_file(follow_symlinks=False) and Path(entry.name).suffix.lower() in IMAGE_SUFFIXES:
+                            count += 1
+                            if count >= limit:
+                                return count, True
+                    except OSError:
+                        truncated = True
+        except OSError:
+            truncated = True
+    return count, truncated
+
+
+def default_project_workspace(data_root: Path) -> Path:
+    data_root = canonical_path(data_root)
+    return data_root.parent / f"{data_root.name}_{PROJECT_WORKSPACE_DIR}"
+
+
+def project_root(workspace_root: Path, company: str, project: str) -> Path:
+    return canonical_path(workspace_root) / safe_slug(company) / safe_slug(project)
+
+
+def category_output_root(workspace_root: Path, company: str, project: str, category: str) -> Path:
+    return project_root(workspace_root, company, project) / "categories" / safe_slug(category)
+
+
+@dataclass
+class ProjectCategory:
+    name: str
+    original_root: str
+    output_root: str
+    image_count: int
+    image_count_truncated: bool
+    state: str
+    reviewed: int = 0
+    keep: int = 0
+    reject: int = 0
+    skip: int = 0
+    exported: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def project_category_state(output_root: Path) -> dict[str, int | str]:
+    state: dict[str, int | str] = {
+        "state": "pending",
+        "reviewed": 0,
+        "keep": 0,
+        "reject": 0,
+        "skip": 0,
+        "exported": 0,
+    }
+    state_file = output_root / ".review_state.json"
+    current_decision_fingerprint: str | None = None
+    if state_file.is_file():
+        try:
+            payload = json.loads(state_file.read_text(encoding="utf-8"))
+            decisions = payload.get("decisions", {})
+            if isinstance(decisions, dict):
+                values = [value for value in decisions.values() if value in DECISIONS]
+                current_decision_fingerprint = decision_fingerprint(decisions)
+                state["reviewed"] = len(values)
+                state["keep"] = values.count("keep")
+                state["reject"] = values.count("reject")
+                state["skip"] = values.count("skip")
+                if values:
+                    state["state"] = "in_review"
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            state["state"] = "state_error"
+    summary_file = output_root / "export_summary.json"
+    if summary_file.is_file():
+        try:
+            summary = json.loads(summary_file.read_text(encoding="utf-8"))
+            exported = int(summary.get("exported", 0)) if isinstance(summary, dict) else 0
+            state["exported"] = max(0, exported)
+            if exported > 0:
+                exported_fingerprint = summary.get("decision_fingerprint") if isinstance(summary, dict) else None
+                if (
+                    isinstance(exported_fingerprint, str)
+                    and current_decision_fingerprint is not None
+                    and exported_fingerprint == current_decision_fingerprint
+                ):
+                    state["state"] = "exported"
+                else:
+                    state["state"] = "export_stale"
+        except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+            state["state"] = "state_error"
+    return state
+
+
+def project_manifest(
+    data_root: Path,
+    workspace_root: Path,
+    company: str,
+    project: str,
+    categories: list[ProjectCategory],
+) -> dict[str, Any]:
+    return {
+        "app_version": APP_VERSION,
+        "company": company,
+        "project": project,
+        "data_root": str(canonical_path(data_root)),
+        "workspace_root": str(canonical_path(workspace_root)),
+        "project_root": str(project_root(workspace_root, company, project)),
+        "updated_at": utc_now(),
+        "categories": [category.to_dict() for category in categories],
+    }
+
+
+def scan_project_categories(
+    data_root: Path,
+    company: str,
+    project: str,
+    workspace_root: Path | None = None,
+    image_scan_limit: int = PROJECT_IMAGE_SCAN_LIMIT,
+) -> dict[str, Any]:
+    data_root = canonical_path(data_root)
+    if not data_root.is_dir():
+        raise ValueError(f"数据根目录不存在或不是目录: {data_root}")
+    if not company.strip():
+        raise ValueError("company 不能为空")
+    if not project.strip():
+        raise ValueError("project 不能为空")
+    workspace_root = canonical_path(workspace_root) if workspace_root is not None else default_project_workspace(data_root)
+    if paths_overlap(workspace_root, data_root):
+        raise ValueError("项目工作区不能与原始数据根目录相同、位于其内部或包含它")
+    categories: list[ProjectCategory] = []
+    category_slugs: dict[str, str] = {}
+    try:
+        children = sorted((path for path in data_root.iterdir() if path.is_dir()), key=lambda path: path.name)
+    except OSError as exc:
+        raise ValueError(f"无法读取数据根目录: {exc}") from exc
+    for child in children:
+        if child.name in PROJECT_SCAN_IGNORED_DIRS:
+            continue
+        count, truncated = count_images_bounded(child, image_scan_limit)
+        if count <= 0:
+            continue
+        category_slug = safe_slug(child.name)
+        previous_category = category_slugs.get(category_slug)
+        if previous_category is not None and previous_category != child.name:
+            raise ValueError(
+                f"项目分类名称冲突：{previous_category} 和 {child.name} 都映射为 {category_slug}，"
+                "请重命名分类后再扫描"
+            )
+        category_slugs[category_slug] = child.name
+        output_root = category_output_root(workspace_root, company, project, child.name)
+        state = project_category_state(output_root)
+        categories.append(
+            ProjectCategory(
+                name=child.name,
+                original_root=str(child),
+                output_root=str(output_root),
+                image_count=count,
+                image_count_truncated=truncated,
+                state=str(state["state"]),
+                reviewed=int(state["reviewed"]),
+                keep=int(state["keep"]),
+                reject=int(state["reject"]),
+                skip=int(state["skip"]),
+                exported=int(state["exported"]),
+            )
+        )
+    return project_manifest(data_root, workspace_root, company, project, categories)
+
+
+def write_project_manifest(payload: dict[str, Any]) -> Path:
+    project_path = Path(str(payload["project_root"]))
+    manifest_path = project_path / PROJECT_META_FILE
+    atomic_write_text(manifest_path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+    return manifest_path
 
 
 def resolve_manifest_path(value: str | None, root: Path | None, manifest_path: Path) -> Path | None:
@@ -200,12 +455,14 @@ class PairingEngine:
         label_root: Path | None = None,
         manifest_path: Path | None = None,
         include_original_only: bool = True,
+        ignored_dirs: Iterable[str] | None = None,
     ) -> None:
         self.visual_root = canonical_path(visual_root) if visual_root is not None else None
         self.original_root = canonical_path(original_root)
         self.label_root = canonical_path(label_root) if label_root else None
         self.manifest_path = canonical_path(manifest_path) if manifest_path else None
         self.include_original_only = include_original_only
+        self.ignored_dirs = set(ignored_dirs or ())
 
     def _label_for(self, visual_rel: str | None, original_rel: str | None) -> tuple[Path | None, list[str]]:
         if self.label_root is None:
@@ -310,8 +567,8 @@ class PairingEngine:
     def scan(self) -> list[PairRecord]:
         if self.manifest_path:
             return self._manifest_rows()
-        visuals = image_files(self.visual_root) if self.visual_root is not None else []
-        originals = image_files(self.original_root)
+        visuals = image_files(self.visual_root, self.ignored_dirs) if self.visual_root is not None else []
+        originals = image_files(self.original_root, self.ignored_dirs)
         visual_by_rel = {path.relative_to(self.visual_root).as_posix(): path for path in visuals}
         original_by_rel = {path.relative_to(self.original_root).as_posix(): path for path in originals}
         visual_by_stem: dict[str, list[Path]] = {}
@@ -1216,6 +1473,7 @@ def export_dataset(
         "formats": sorted(selected_formats),
         "annotation_guide": str(output_root / "annotation_guide"),
         "output_root": str(output_root),
+        "decision_fingerprint": decision_fingerprint(store.decisions),
         "decision_state_timestamp": max(
             [store.decision_timestamp(record.sample_id) for record in records]
             or ["1970-01-01T00:00:00+00:00"]
@@ -1271,6 +1529,14 @@ button:disabled { opacity:.45; cursor:not-allowed; transform:none; }
 .setup-options { display:flex; gap:12px; flex-wrap:wrap; margin:18px 0; color:var(--muted); }
 .setup-options label { display:flex; align-items:center; gap:6px; }
 .setup-options input { accent-color:var(--accent); }
+.project-panel { margin:18px 0 22px; padding:16px; border:1px solid var(--line); border-radius:12px; background:rgba(17,24,39,.48); }
+.project-panel h3 { margin:0 0 6px; font-size:16px; }
+.project-panel p { margin:4px 0 12px; color:var(--muted); }
+.project-actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }
+.project-categories { display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:10px; margin-top:12px; }
+.project-category { text-align:left; padding:12px; border:1px solid var(--line); background:rgba(39,52,73,.75); border-radius:10px; }
+.project-category strong { display:block; font-size:15px; margin-bottom:4px; }
+.project-category span { display:block; color:var(--muted); font-size:12px; }
 .export-options { display:flex; gap:7px; align-items:center; flex-wrap:wrap; padding:6px 8px; border-left:1px solid var(--line); }
 .export-options strong { color:#a5f3fc; font-size:12px; letter-spacing:.06em; text-transform:uppercase; }
 .export-options label { display:flex; align-items:center; gap:4px; color:var(--muted); font-size:12px; }
@@ -1301,6 +1567,29 @@ button:disabled { opacity:.45; cursor:not-allowed; transform:none; }
   <section class="setup" id="setupPanel" hidden>
     <h2>选择本机文件夹</h2>
     <p>点击按钮会打开当前电脑的系统目录选择器。路径只在本机审核服务中使用，不会上传到云端。</p>
+    <div class="project-panel">
+      <h3>项目工作台：公司 / 项目 / 分类</h3>
+      <p>适合现场硬盘数据：选择项目数据根目录后，一级子目录会作为待处理分类管理，例如“分类A”“分类B”“分类C”。如有模型预标注，可在下方选择可视化图和 YOLO 标签目录，打开分类时会一并带入。</p>
+      <div class="setup-grid">
+        <label for="dataRoot">数据根目录（例如 /data/现场项目）</label>
+        <input id="dataRoot" readonly placeholder="请选择公司项目的数据根目录">
+        <button data-directory="data_root">选择文件夹</button>
+        <label for="workspaceRoot">项目工作区（可选，默认建在数据根目录同级）</label>
+        <input id="workspaceRoot" readonly placeholder="可留空；不能放在原始数据目录内">
+        <button data-directory="workspace_root">选择文件夹</button>
+        <label for="companyName">公司</label>
+        <input id="companyName" value="" placeholder="例如：示例公司">
+        <span></span>
+        <label for="projectName">项目</label>
+        <input id="projectName" value="" placeholder="例如：现场数据项目">
+        <span></span>
+      </div>
+      <div class="project-actions">
+        <button class="audit" id="scanProject">扫描项目分类</button>
+      </div>
+      <div class="project-categories" id="projectCategories"></div>
+    </div>
+    <h3>直接打开单个目录</h3>
     <div class="setup-grid">
       <label for="visualRoot">模型可视化图文件夹（可选）</label>
       <input id="visualRoot" readonly placeholder="如有模型预标注可视化图则选择；否则可留空">
@@ -1350,9 +1639,9 @@ button:disabled { opacity:.45; cursor:not-allowed; transform:none; }
   </div>
 </main>
 <script>
-const state = { ready: false, records: [], decisions: {}, stats: {}, preflight: {completed:false,summary:{}}, filter: "all", cursor: 0, scale: 1, detail: null };
+const state = { ready: false, records: [], decisions: {}, stats: {}, preflight: {completed:false,summary:{}}, filter: "all", cursor: 0, scale: 1, detail: null, project: null, projectScan: null };
 const $ = id => document.getElementById(id);
-const inputForDirectory = { visual_root: "visualRoot", original_root: "originalRoot", label_root: "labelRoot", output_root: "outputRoot" };
+const inputForDirectory = { data_root: "dataRoot", workspace_root: "workspaceRoot", visual_root: "visualRoot", original_root: "originalRoot", label_root: "labelRoot", output_root: "outputRoot" };
 function setSetupStatus(message, error=false) { $("setupStatus").textContent = message; $("setupStatus").style.color = error ? "#fca5a5" : "#bfdbfe"; }
 function showSetup(message="请选择文件夹后开始审核。") {
   $("setupPanel").hidden = false; $("reviewUi").hidden = true; setSetupStatus(message);
@@ -1368,6 +1657,54 @@ function fillSetup(config) {
     $("allowImagesWithoutLabels").checked = !!config.allow_images_without_labels;
     $("classNames").value = (config.class_names || []).join("\n");
   }
+}
+function projectRequest(extra={}) {
+  return {
+    data_root: $("dataRoot").value,
+    workspace_root: $("workspaceRoot").value || null,
+    company: $("companyName").value.trim(),
+    project: $("projectName").value.trim(),
+    visual_root: $("visualRoot").value || null,
+    label_root: $("labelRoot").value || null,
+    include_visualizations: $("includeVisualizations").checked,
+    allow_images_without_labels: $("allowImagesWithoutLabels").checked,
+    class_names: $("classNames").value.split(/\r?\n/).map(name => name.trim()).filter(Boolean),
+    ...extra
+  };
+}
+function renderProjectCategories(payload) {
+  const box = $("projectCategories");
+  if (!payload || !payload.categories || !payload.categories.length) {
+    box.innerHTML = '<div class="placeholder">尚未扫描，或没有找到包含图片的一级分类。</div>';
+    return;
+  }
+  const stateLabel = {pending:"待处理", in_review:"审核中", exported:"已导出", export_stale:"导出过期", state_error:"状态异常"};
+  box.innerHTML = payload.categories.map(item => `
+    <button class="project-category" data-project-category="${esc(item.name)}">
+      <strong>${esc(item.name)}</strong>
+      <span>图片：${item.image_count}${item.image_count_truncated ? "+" : ""} · 状态：${stateLabel[item.state] || item.state}</span>
+      <span>已审 ${item.reviewed} · 保留 ${item.keep} · 排除 ${item.reject} · 导出 ${item.exported}</span>
+    </button>
+  `).join("");
+  box.querySelectorAll("[data-project-category]").forEach(button => button.onclick = () => openProjectCategory(button.dataset.projectCategory));
+}
+async function scanProject() {
+  if (!$("dataRoot").value || !$("companyName").value.trim() || !$("projectName").value.trim()) {
+    setSetupStatus("请填写数据根目录、公司和项目名称。", true); return;
+  }
+  setSetupStatus("正在扫描项目分类；大目录会做有上限的计数，不会修改源数据…");
+  const response = await fetch("/api/project/scan", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(projectRequest({persist:true}))});
+  const payload = await response.json();
+  if (!response.ok) { setSetupStatus(payload.error || "项目扫描失败", true); return; }
+  state.projectScan = payload; renderProjectCategories(payload);
+  setSetupStatus(`项目已扫描：${payload.categories.length} 个分类。点击分类卡片进入审核。`);
+}
+async function openProjectCategory(category) {
+  setSetupStatus(`正在打开分类：${category}…`);
+  const response = await fetch("/api/project/open", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(projectRequest({category}))});
+  const payload = await response.json();
+  if (!response.ok) { setSetupStatus(payload.error || "打开分类失败", true); return; }
+  state.cursor = 0; await reload(payload);
 }
 async function chooseDirectory(field) {
   setSetupStatus("正在打开系统目录选择器，请在弹出的窗口中选择文件夹…");
@@ -1445,7 +1782,8 @@ async function render() {
       preflight.duplicate ? `${preflight.duplicate.kind === "exact" ? "精确" : "近似"}重复` : ""
     ].filter(Boolean).join("；") || "通过" : "未找到"
   );
-  $("info").innerHTML = [
+  const infoRows = [
+    ...(state.project ? [["项目分类", `${state.project.company} / ${state.project.project} / ${state.project.category}`]] : []),
     ["进度", `${state.cursor + 1} / ${list.length}（总计 ${state.records.length}）`],
     ["文件名", record.visual_rel || record.original_rel || "未知"],
     ["模型图尺寸", detail.visual_dimensions ? detail.visual_dimensions.join(" × ") : "未知"],
@@ -1455,7 +1793,8 @@ async function render() {
     ["样本 ID", record.sample_id],
     ["配对状态", record.anomalies.length ? `<span class="warning">${esc(record.anomalies.join(", "))}</span>` : "正常"],
     ["质量预检", preflightText === "通过" ? preflightText : `<span class="warning">${esc(preflightText)}</span>`],
-  ].map(([k,v]) => `<div><div class="label">${k}</div><div class="value">${v}</div></div>`).join("");
+  ];
+  $("info").innerHTML = infoRows.map(([k,v]) => `<div><div class="label">${k}</div><div class="value">${v}</div></div>`).join("");
   setStatus(`当前：${record.visual_rel || record.original_rel} · ${d} · 缩放 ${Math.round(state.scale*100)}%`);
 }
 async function reload(existingPayload=null) {
@@ -1466,7 +1805,7 @@ async function reload(existingPayload=null) {
   fillSetup(payload.config);
   if (!state.ready) { showSetup(); return; }
   showReview();
-  state.records = payload.records; state.decisions = payload.decisions; state.stats = payload.stats; state.preflight = payload.preflight || {completed:false,summary:{}};
+  state.records = payload.records; state.decisions = payload.decisions; state.stats = payload.stats; state.preflight = payload.preflight || {completed:false,summary:{}}; state.project = payload.project || null;
   const list = currentList(); if (state.cursor >= list.length) state.cursor = Math.max(0, list.length - 1);
   await render();
 }
@@ -1518,6 +1857,7 @@ async function rejectDuplicates() {
 document.querySelectorAll("[data-decision]").forEach(button => button.onclick = () => decide(button.dataset.decision));
 document.querySelectorAll("[data-directory]").forEach(button => button.onclick = () => chooseDirectory(button.dataset.directory));
 $("configure").onclick = configureReview;
+$("scanProject").onclick = scanProject;
 $("prev").onclick = () => { state.cursor = Math.max(0, state.cursor - 1); render(); };
 $("next").onclick = () => { state.cursor = Math.min(currentList().length - 1, state.cursor + 1); render(); };
 $("undo").onclick = undo; $("export").onclick = exportData;
@@ -1573,6 +1913,7 @@ class ReviewApplication:
         self.class_names = [str(name).strip() for name in class_names or () if str(name).strip()]
         self.instance_id = instance_id or uuid.uuid4().hex
         self.lock = threading.RLock()
+        self.project_context: dict[str, Any] | None = None
         self.records = self.engine.scan() if self.engine is not None else []
         self.preflight_report = (
             load_matching_preflight_report(self.output_root, self.records)
@@ -1612,6 +1953,7 @@ class ReviewApplication:
         include_visualizations: bool = True,
         allow_images_without_labels: bool = True,
         class_names: Iterable[str] | None = None,
+        ignored_dirs: Iterable[str] | None = None,
     ) -> None:
         visual_root = canonical_path(visual_root) if visual_root is not None else None
         original_root = canonical_path(original_root)
@@ -1630,6 +1972,7 @@ class ReviewApplication:
             label_root,
             manifest_path,
             include_original_only=not candidate_only,
+            ignored_dirs=ignored_dirs,
         )
         records = engine.scan()
         store = ReviewStore(output_root / ".review_state.json")
@@ -1644,6 +1987,79 @@ class ReviewApplication:
             self.records = records
             self.preflight_report = load_matching_preflight_report(output_root, records)
             self.preflight_by_sample_id = self._preflight_index(self.preflight_report)
+            self.project_context = None
+
+    def scan_project(
+        self,
+        data_root: Path,
+        company: str,
+        project: str,
+        workspace_root: Path | None = None,
+        persist: bool = False,
+    ) -> dict[str, Any]:
+        payload = scan_project_categories(data_root, company, project, workspace_root)
+        if persist:
+            write_project_manifest(payload)
+        return payload
+
+    def refresh_project_manifest(self) -> None:
+        """Recompute the project dashboard after a category state change."""
+        with self.lock:
+            context = dict(self.project_context or {})
+        if not context:
+            return
+        payload = scan_project_categories(
+            Path(str(context["data_root"])),
+            str(context["company"]),
+            str(context["project"]),
+            Path(str(context["workspace_root"])),
+        )
+        manifest_path = write_project_manifest(payload)
+        with self.lock:
+            if self.project_context is not None:
+                self.project_context["project_manifest"] = str(manifest_path)
+
+    def configure_from_project_category(
+        self,
+        data_root: Path,
+        company: str,
+        project: str,
+        category: str,
+        workspace_root: Path | None = None,
+        visual_root: Path | None = None,
+        label_root: Path | None = None,
+        include_visualizations: bool = True,
+        allow_images_without_labels: bool = True,
+        class_names: Iterable[str] | None = None,
+    ) -> None:
+        payload = scan_project_categories(data_root, company, project, workspace_root)
+        category_payload = next(
+            (item for item in payload["categories"] if item["name"] == category),
+            None,
+        )
+        if category_payload is None:
+            raise ValueError(f"项目分类不存在或没有图片: {category}")
+        self.configure_from_directories(
+            visual_root,
+            Path(str(category_payload["original_root"])),
+            Path(str(category_payload["output_root"])),
+            label_root=label_root,
+            candidate_only=False,
+            include_visualizations=include_visualizations,
+            allow_images_without_labels=allow_images_without_labels,
+            class_names=class_names,
+            ignored_dirs=PROJECT_SCAN_IGNORED_DIRS,
+        )
+        with self.lock:
+            self.project_context = {
+                "company": company,
+                "project": project,
+                "category": category,
+                "data_root": str(canonical_path(data_root)),
+                "workspace_root": payload["workspace_root"],
+                "project_root": payload["project_root"],
+                "project_manifest": str(write_project_manifest(payload)),
+            }
 
     def rescan(self) -> None:
         engine, _, _ = self.require_ready()
@@ -1681,6 +2097,13 @@ class ReviewApplication:
             if decision == "keep" and (record.original_path is None or not record.original_path.is_file()):
                 raise ValueError("缺失原图的样本不能保留")
             store.set_decision(sample_id, decision)
+        self.refresh_project_manifest()
+
+    def undo(self) -> str | None:
+        _, store, _ = self.require_ready()
+        sample_id = store.undo()
+        self.refresh_project_manifest()
+        return sample_id
 
     def reject_duplicate_candidates(self) -> int:
         """Mark only non-representative duplicate candidates as rejected."""
@@ -1697,7 +2120,9 @@ class ReviewApplication:
                 and sample.get("sample_id") in record_ids
                 and isinstance(sample.get("duplicate"), dict)
             ]
-            return store.set_decisions(duplicate_ids, "reject")
+            affected = store.set_decisions(duplicate_ids, "reject")
+        self.refresh_project_manifest()
+        return affected
 
     def state_payload(self) -> dict[str, Any]:
         with self.lock:
@@ -1719,6 +2144,7 @@ class ReviewApplication:
                         "allow_images_without_labels": self.allow_images_without_labels,
                         "class_names": self.class_names,
                     },
+                    "project": self.project_context,
                     "preflight": {"completed": False, "summary": {}},
                 }
             engine, store, output_root = self.require_ready()
@@ -1743,6 +2169,7 @@ class ReviewApplication:
                     "completed": self.preflight_report is not None,
                     "summary": (self.preflight_report or {}).get("summary", {}),
                 },
+                "project": self.project_context,
             }
 
     def detail(self, sample_id: str) -> dict[str, Any] | None:
@@ -1897,6 +2324,69 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                 )
                 self.send_json(self.application.state_payload())
                 return
+            if parsed.path in {"/api/project/scan", "/api/project/open"}:
+                payload = self.read_json()
+
+                def required_path(key: str) -> Path:
+                    value = payload.get(key)
+                    if not isinstance(value, str) or not value.strip():
+                        raise ValueError(f"{key} 必须是非空目录路径")
+                    return Path(value)
+
+                def optional_path(key: str) -> Path | None:
+                    value = payload.get(key)
+                    if value in (None, ""):
+                        return None
+                    if not isinstance(value, str):
+                        raise ValueError(f"{key} 必须是目录路径或 null")
+                    return Path(value)
+
+                def required_string(key: str) -> str:
+                    value = payload.get(key)
+                    if not isinstance(value, str) or not value.strip():
+                        raise ValueError(f"{key} 必须是非空字符串")
+                    return value.strip()
+
+                def boolean(key: str, default: bool) -> bool:
+                    value = payload.get(key, default)
+                    if not isinstance(value, bool):
+                        raise ValueError(f"{key} 必须是 true 或 false")
+                    return value
+
+                def string_list(key: str) -> list[str]:
+                    value = payload.get(key, [])
+                    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+                        raise ValueError(f"{key} 必须是字符串数组")
+                    return [item.strip() for item in value if item.strip()]
+
+                data_root = required_path("data_root")
+                company = required_string("company")
+                project = required_string("project")
+                workspace_root = optional_path("workspace_root")
+                if parsed.path == "/api/project/scan":
+                    project_payload = self.application.scan_project(
+                        data_root,
+                        company,
+                        project,
+                        workspace_root=workspace_root,
+                        persist=boolean("persist", False),
+                    )
+                    self.send_json(project_payload)
+                    return
+                self.application.configure_from_project_category(
+                    data_root,
+                    company,
+                    project,
+                    required_string("category"),
+                    workspace_root=workspace_root,
+                    visual_root=optional_path("visual_root"),
+                    label_root=optional_path("label_root"),
+                    include_visualizations=boolean("include_visualizations", True),
+                    allow_images_without_labels=boolean("allow_images_without_labels", True),
+                    class_names=string_list("class_names"),
+                )
+                self.send_json(self.application.state_payload())
+                return
             if parsed.path == "/api/decision":
                 payload = self.read_json()
                 self.application.set_decision(str(payload["sample_id"]), str(payload["decision"]))
@@ -1909,8 +2399,8 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                 )
                 return
             if parsed.path == "/api/undo":
+                sample_id = self.application.undo()
                 _, store, _ = self.application.require_ready()
-                sample_id = store.undo()
                 self.send_json(
                     {
                         "sample_id": sample_id,
@@ -1947,6 +2437,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                     class_names=self.application.class_names,
                     preflight_report=self.application.preflight_report,
                 )
+                self.application.refresh_project_manifest()
                 self.send_json(summary)
                 return
             if parsed.path == "/api/preflight":
@@ -1972,6 +2463,8 @@ class ReviewServer(http.server.ThreadingHTTPServer):
 
     def select_directory(self, field: str) -> Path | None:
         titles = {
+            "data_root": "选择项目数据根目录",
+            "workspace_root": "选择项目工作区（可选）",
             "visual_root": "选择模型可视化图文件夹（可选）",
             "original_root": "选择原图文件夹",
             "label_root": "选择 YOLO 标签文件夹（可取消）",
@@ -2031,11 +2524,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.host != "127.0.0.1":
+        raise SystemExit("为保护本机图片与审核状态，服务仅允许监听 127.0.0.1")
     try:
         configured_roots = (args.original_root, args.output_root)
         if args.web_setup:
-            if args.host != "127.0.0.1":
-                raise ValueError("网页文件夹选择模式仅允许监听 127.0.0.1")
             application = ReviewApplication(instance_id=args.instance_id)
         else:
             if any(path is None for path in configured_roots):
