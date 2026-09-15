@@ -7,7 +7,8 @@
   "manifest": null,
   "candidate_only": false,
   "include_visualizations": true,
-  "allow_images_without_labels": false,
+  "allow_images_without_labels": true,
+  "class_names": [],
   "host": "127.0.0.1",
   "port": 8765
 }

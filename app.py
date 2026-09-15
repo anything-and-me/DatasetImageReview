@@ -25,6 +25,7 @@ import threading
 from typing import Any, Iterable
 from urllib.parse import unquote, urlparse
 import uuid
+from xml.sax.saxutils import escape as xml_escape
 
 from PIL import Image
 
@@ -32,7 +33,8 @@ from PIL import Image
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
 DECISIONS = {"keep", "reject", "skip"}
 DECISION_LABELS = {"keep": "保留", "reject": "不保留", "skip": "跳过", None: "未审核"}
-APP_VERSION = "1.2.0"
+EXPORT_FORMATS = {"yolo", "coco", "cvat", "label_studio"}
+APP_VERSION = "1.3.0"
 
 
 def utc_now() -> str:
@@ -51,9 +53,41 @@ def is_inside(path: Path, root: Path) -> bool:
     return True
 
 
-def relative_posix(path: Path | None, root: Path) -> str | None:
+def paths_overlap(first: Path, second: Path) -> bool:
+    """Return whether two directory trees overlap in either direction."""
+    return is_inside(first, second) or is_inside(second, first)
+
+
+def validate_input_roots(
+    visual_root: Path | None,
+    original_root: Path,
+    output_root: Path,
+    label_root: Path | None = None,
+) -> None:
+    """Validate the local-only input contract before state or exports are written."""
+    if not original_root.is_dir():
+        raise ValueError(f"原图文件夹不存在或不是目录: {original_root}")
+    if not image_files(original_root):
+        raise ValueError("原图文件夹必须至少包含一张 .jpg、.jpeg 或 .png 图片")
+    if visual_root is not None and not visual_root.is_dir():
+        raise ValueError(f"模型可视化图文件夹不存在或不是目录: {visual_root}")
+    if label_root is not None and not label_root.is_dir():
+        raise ValueError(f"标签文件夹不存在或不是目录: {label_root}")
+
+    for name, input_root in (
+        ("原图文件夹", original_root),
+        ("模型可视化图文件夹", visual_root),
+        ("标签文件夹", label_root),
+    ):
+        if input_root is not None and paths_overlap(output_root, input_root):
+            raise ValueError(f"导出目录不能与{name}相同、位于其内部或包含它")
+
+
+def relative_posix(path: Path | None, root: Path | None) -> str | None:
     if path is None:
         return None
+    if root is None:
+        return path.name
     try:
         return path.resolve().relative_to(root.resolve()).as_posix()
     except ValueError:
@@ -70,7 +104,7 @@ def image_files(root: Path) -> list[Path]:
     )
 
 
-def resolve_manifest_path(value: str | None, root: Path, manifest_path: Path) -> Path | None:
+def resolve_manifest_path(value: str | None, root: Path | None, manifest_path: Path) -> Path | None:
     if not value:
         return None
     candidate = Path(value).expanduser()
@@ -81,8 +115,7 @@ def resolve_manifest_path(value: str | None, root: Path, manifest_path: Path) ->
         candidates.extend(
             [
                 manifest_path.parent / candidate,
-                root.parent / candidate,
-                root / candidate,
+                *((root.parent / candidate, root / candidate) if root is not None else ()),
             ]
         )
     for option in candidates:
@@ -114,6 +147,17 @@ def validate_label(path: Path) -> list[str]:
             anomalies.append(f"invalid_label:{line_number}")
             continue
         if class_id < 0 or not all(0.0 <= value <= 1.0 for value in values[:4]):
+            anomalies.append(f"invalid_label:{line_number}")
+            continue
+        center_x, center_y, width, height = values[:4]
+        if (
+            width <= 0.0
+            or height <= 0.0
+            or center_x - width / 2 < 0.0
+            or center_x + width / 2 > 1.0
+            or center_y - height / 2 < 0.0
+            or center_y + height / 2 > 1.0
+        ):
             anomalies.append(f"invalid_label:{line_number}")
             continue
         if len(values) == 5 and not 0.0 <= values[4] <= 1.0:
@@ -151,13 +195,13 @@ class PairRecord:
 class PairingEngine:
     def __init__(
         self,
-        visual_root: Path,
+        visual_root: Path | None,
         original_root: Path,
         label_root: Path | None = None,
         manifest_path: Path | None = None,
         include_original_only: bool = True,
     ) -> None:
-        self.visual_root = canonical_path(visual_root)
+        self.visual_root = canonical_path(visual_root) if visual_root is not None else None
         self.original_root = canonical_path(original_root)
         self.label_root = canonical_path(label_root) if label_root else None
         self.manifest_path = canonical_path(manifest_path) if manifest_path else None
@@ -180,7 +224,7 @@ class PairingEngine:
         if len(unique) > 1:
             return None, ["duplicate_label"]
         if not unique:
-            return None, ["missing_label"]
+            return None, []
         anomalies = validate_label(unique[0])
         return unique[0], anomalies
 
@@ -194,7 +238,7 @@ class PairingEngine:
         label_value: str | None = None,
     ) -> PairRecord:
         anomalies: list[str] = []
-        if visual_path is None:
+        if visual_path is None and self.visual_root is not None:
             anomalies.append("missing_visual")
         if original_path is None:
             anomalies.append("missing_original")
@@ -242,9 +286,13 @@ class PairingEngine:
         for row_index, row in enumerate(rows, start=1):
             visual_value = row.get("visual_image") or row.get("visual") or row.get("visual_rel")
             original_value = row.get("original_image") or row.get("original") or row.get("original_rel")
-            visual_path = resolve_manifest_path(visual_value, self.visual_root, self.manifest_path)
+            visual_path = (
+                resolve_manifest_path(visual_value, self.visual_root, self.manifest_path)
+                if self.visual_root is not None and visual_value
+                else None
+            )
             original_path = resolve_manifest_path(original_value, self.original_root, self.manifest_path)
-            visual_rel = relative_posix(visual_path, self.visual_root) if visual_path else visual_value
+            visual_rel = relative_posix(visual_path, self.visual_root) if visual_path else None
             original_rel = relative_posix(original_path, self.original_root) if original_path else original_value
             record = self._record(
                 str(row.get("sample_id") or row.get("id") or "") or None,
@@ -262,7 +310,7 @@ class PairingEngine:
     def scan(self) -> list[PairRecord]:
         if self.manifest_path:
             return self._manifest_rows()
-        visuals = image_files(self.visual_root)
+        visuals = image_files(self.visual_root) if self.visual_root is not None else []
         originals = image_files(self.original_root)
         visual_by_rel = {path.relative_to(self.visual_root).as_posix(): path for path in visuals}
         original_by_rel = {path.relative_to(self.original_root).as_posix(): path for path in originals}
@@ -377,6 +425,39 @@ class ReviewStore:
             self.decisions[sample_id] = decision
             self._write()
 
+    def set_decisions(self, sample_ids: Iterable[str], decision: str) -> int:
+        """Persist a reversible batch decision without touching source files."""
+        if decision not in DECISIONS:
+            raise ValueError(f"unsupported decision: {decision}")
+        unique_ids = list(dict.fromkeys(str(sample_id) for sample_id in sample_ids))
+        if not unique_ids:
+            return 0
+        with self.lock:
+            timestamp = utc_now()
+            for sample_id in unique_ids:
+                previous = self.decisions.get(sample_id)
+                self.history.append(
+                    {
+                        "sample_id": sample_id,
+                        "previous": previous,
+                        "decision": decision,
+                        "timestamp": timestamp,
+                    }
+                )
+                self.decisions[sample_id] = decision
+            self._write()
+        return len(unique_ids)
+
+    def decision_timestamp(self, sample_id: str) -> str:
+        """Return the timestamp of the current decision, or a stable default."""
+        decision = self.decisions.get(sample_id)
+        for action in reversed(self.history):
+            if action.get("sample_id") == sample_id and action.get("decision") == decision:
+                timestamp = action.get("timestamp")
+                if isinstance(timestamp, str):
+                    return timestamp
+        return "1970-01-01T00:00:00+00:00"
+
     def undo(self) -> str | None:
         with self.lock:
             if not self.history:
@@ -414,6 +495,207 @@ def empty_stats() -> dict[str, int]:
         "unreviewed": 0,
         "anomalies": 0,
     }
+
+
+def quality_metrics(path: Path) -> tuple[dict[str, float | int], int]:
+    """Read one image at a time and return lightweight image-quality metrics."""
+    with Image.open(path) as image:
+        image.load()
+        width, height = image.size
+        grayscale = image.convert("L")
+        grayscale.thumbnail((192, 192))
+        pixels = list(grayscale.get_flattened_data())
+    if not pixels:
+        raise ValueError("empty image")
+    pixel_count = len(pixels)
+    brightness = sum(pixels) / pixel_count
+    variance = sum((value - brightness) ** 2 for value in pixels) / pixel_count
+    contrast = variance ** 0.5
+    preview_width, preview_height = grayscale.size
+    if preview_width < 2 or preview_height < 2:
+        detail = 0.0
+    else:
+        horizontal = sum(
+            abs(pixels[row * preview_width + column] - pixels[row * preview_width + column - 1])
+            for row in range(preview_height)
+            for column in range(1, preview_width)
+        )
+        vertical = sum(
+            abs(pixels[row * preview_width + column] - pixels[(row - 1) * preview_width + column])
+            for row in range(1, preview_height)
+            for column in range(preview_width)
+        )
+        detail = (horizontal + vertical) / (
+            preview_height * (preview_width - 1) + (preview_height - 1) * preview_width
+        )
+
+    d_hash_image = grayscale.resize((9, 8))
+    d_hash_pixels = list(d_hash_image.get_flattened_data())
+    d_hash = 0
+    for row in range(8):
+        for column in range(8):
+            d_hash = (d_hash << 1) | int(
+                d_hash_pixels[row * 9 + column] > d_hash_pixels[row * 9 + column + 1]
+            )
+    return (
+        {
+            "width": int(width),
+            "height": int(height),
+            "brightness": round(brightness, 2),
+            "contrast": round(contrast, 2),
+            "detail": round(detail, 2),
+        },
+        d_hash,
+    )
+
+
+def run_preflight(
+    records: list[PairRecord],
+    min_dimension: int = 64,
+    near_duplicate_hamming_distance: int = 4,
+) -> dict[str, Any]:
+    """Scan source images sequentially for integrity, quality, and duplicate risks."""
+    samples: list[dict[str, Any]] = []
+    exact_hash_groups: dict[str, list[int]] = {}
+    for record in records:
+        source_path = record.original_path if record.original_path and record.original_path.is_file() else record.visual_path
+        source_rel = record.original_rel or record.visual_rel
+        sample: dict[str, Any] = {
+            "sample_id": record.sample_id,
+            "visual_rel": record.visual_rel,
+            "original_rel": record.original_rel,
+            "source_rel": source_rel,
+            "issues": [],
+            "metrics": None,
+            "duplicate": None,
+        }
+        if source_path is None or not source_path.is_file():
+            sample["issues"].append("missing_image")
+            samples.append(sample)
+            continue
+        try:
+            metrics, d_hash = quality_metrics(source_path)
+            sample["metrics"] = metrics
+            sample["_sha256"] = sha256_file(source_path)
+            sample["_d_hash"] = d_hash
+            if min(metrics["width"], metrics["height"]) < min_dimension:
+                sample["issues"].append("small_image")
+            if metrics["brightness"] < 18:
+                sample["issues"].append("dark_image")
+            elif metrics["brightness"] > 237:
+                sample["issues"].append("bright_image")
+            if metrics["contrast"] < 10:
+                sample["issues"].append("low_contrast")
+            if metrics["detail"] < 2:
+                sample["issues"].append("low_detail")
+            exact_hash_groups.setdefault(sample["_sha256"], []).append(len(samples))
+        except (OSError, ValueError, Image.DecompressionBombError):
+            sample["issues"].append("corrupt_image")
+        samples.append(sample)
+
+    exact_duplicates = 0
+    for member_indexes in exact_hash_groups.values():
+        if len(member_indexes) < 2:
+            continue
+        representative = min(member_indexes, key=lambda index: str(samples[index]["source_rel"] or ""))
+        for index in member_indexes:
+            if index == representative:
+                continue
+            samples[index]["duplicate"] = {
+                "kind": "exact",
+                "representative_sample_id": samples[representative]["sample_id"],
+            }
+            exact_duplicates += 1
+
+    compared_pairs: set[tuple[int, int]] = set()
+    buckets: dict[tuple[int, int], list[int]] = {}
+    for index, sample in enumerate(samples):
+        d_hash = sample.get("_d_hash")
+        if not isinstance(d_hash, int):
+            continue
+        for band in range(4):
+            bucket_key = (band, (d_hash >> (band * 16)) & 0xFFFF)
+            for other_index in buckets.get(bucket_key, []):
+                pair = (other_index, index)
+                if pair in compared_pairs:
+                    continue
+                compared_pairs.add(pair)
+                other = samples[other_index]
+                other_hash = other.get("_d_hash")
+                if (
+                    other.get("duplicate") is None
+                    and sample.get("duplicate") is None
+                    and isinstance(other_hash, int)
+                    and (other_hash ^ d_hash).bit_count() <= near_duplicate_hamming_distance
+                ):
+                    sample["duplicate"] = {
+                        "kind": "near",
+                        "representative_sample_id": other["sample_id"],
+                    }
+                    break
+            buckets.setdefault(bucket_key, []).append(index)
+
+    for sample in samples:
+        sample.pop("_sha256", None)
+        sample.pop("_d_hash", None)
+    quality_issue_count = sum(
+        any(
+            issue in {"small_image", "dark_image", "bright_image", "low_contrast", "low_detail"}
+            for issue in sample["issues"]
+        )
+        for sample in samples
+    )
+    corrupt_count = sum("corrupt_image" in sample["issues"] for sample in samples)
+    duplicate_count = sum(sample["duplicate"] is not None for sample in samples)
+    fingerprint_payload = [
+        {
+            "sample_id": sample["sample_id"],
+            "issues": sample["issues"],
+            "metrics": sample["metrics"],
+            "duplicate": sample["duplicate"],
+        }
+        for sample in samples
+    ]
+    fingerprint = hashlib.sha256(
+        json.dumps(fingerprint_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return {
+        "fingerprint": fingerprint,
+        "settings": {
+            "min_dimension": min_dimension,
+            "near_duplicate_hamming_distance": near_duplicate_hamming_distance,
+        },
+        "summary": {
+            "total": len(samples),
+            "corrupt": corrupt_count,
+            "quality_issues": quality_issue_count,
+            "duplicates": duplicate_count,
+            "exact_duplicates": exact_duplicates,
+            "near_duplicates": duplicate_count - exact_duplicates,
+        },
+        "samples": samples,
+    }
+
+
+def load_matching_preflight_report(output_root: Path, records: Iterable[PairRecord]) -> dict[str, Any] | None:
+    """Restore a report only when it exactly belongs to the current sample set."""
+    report_path = output_root / "preflight_report.json"
+    if not report_path.is_file():
+        return None
+    try:
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    samples = payload.get("samples") if isinstance(payload, dict) else None
+    if not isinstance(samples, list) or not isinstance(payload.get("summary"), dict):
+        return None
+    report_ids = {
+        item.get("sample_id")
+        for item in samples
+        if isinstance(item, dict) and isinstance(item.get("sample_id"), str)
+    }
+    record_ids = {record.sample_id for record in records}
+    return payload if report_ids == record_ids and len(samples) == len(record_ids) else None
 
 
 @dataclass
@@ -540,6 +822,265 @@ def atomic_write_text(path: Path, content: str) -> None:
             os.unlink(temp_name)
 
 
+def write_text_if_same(path: Path, content: str) -> str:
+    """Create a generated artifact or confirm byte-for-byte idempotence."""
+    encoded = content.encode("utf-8")
+    if path.exists():
+        if not path.is_file():
+            return "conflict"
+        try:
+            return "same" if path.read_bytes() == encoded else "conflict"
+        except OSError:
+            return "conflict"
+    atomic_write_text(path, content)
+    return "created"
+
+
+def normalize_export_formats(formats: Iterable[str] | None) -> set[str]:
+    selected = {"yolo"} if formats is None else {str(value) for value in formats}
+    if not selected:
+        raise ValueError("至少选择一种导出格式")
+    unknown = sorted(selected - EXPORT_FORMATS)
+    if unknown:
+        raise ValueError(f"不支持的导出格式: {', '.join(unknown)}")
+    return selected
+
+
+def read_yolo_boxes(path: Path | None) -> list[tuple[int, float, float, float, float]]:
+    if path is None or not path.is_file():
+        return []
+    boxes: list[tuple[int, float, float, float, float]] = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return boxes
+    for line in lines:
+        fields = line.split()
+        if len(fields) not in {5, 6}:
+            continue
+        try:
+            class_id = int(fields[0])
+            center_x, center_y, width, height = (float(value) for value in fields[1:5])
+        except ValueError:
+            continue
+        if (
+            class_id < 0
+            or not all(0.0 <= value <= 1.0 for value in (center_x, center_y, width, height))
+            or width <= 0.0
+            or height <= 0.0
+            or center_x - width / 2 < 0.0
+            or center_x + width / 2 > 1.0
+            or center_y - height / 2 < 0.0
+            or center_y + height / 2 > 1.0
+        ):
+            continue
+        boxes.append((class_id, center_x, center_y, width, height))
+    return boxes
+
+
+def resolved_class_names(records: Iterable[PairRecord], class_names: Iterable[str] | None) -> list[str]:
+    names = [str(name).strip() for name in class_names or () if str(name).strip()]
+    highest_class_id = -1
+    for record in records:
+        for class_id, *_ in read_yolo_boxes(record.label_path):
+            highest_class_id = max(highest_class_id, class_id)
+    if highest_class_id < 0 and not names:
+        highest_class_id = 0
+    while len(names) <= highest_class_id:
+        names.append(f"class_{len(names)}")
+    return names
+
+
+def yolo_dataset_yaml(class_names: list[str]) -> str:
+    names = "\n".join(f"  {index}: {json.dumps(name, ensure_ascii=False)}" for index, name in enumerate(class_names))
+    return (
+        "path: .\n"
+        "train: images\n"
+        "val: images\n"
+        f"nc: {len(class_names)}\n"
+        "names:\n"
+        f"{names}\n"
+    )
+
+
+def write_coco_export(output_root: Path, records: list[PairRecord], class_names: list[str]) -> list[Path]:
+    images: list[dict[str, Any]] = []
+    annotations: list[dict[str, Any]] = []
+    annotation_id = 1
+    for image_id, record in enumerate(records, start=1):
+        if record.original_path is None:
+            continue
+        dimensions = read_dimensions(record.original_path)
+        if dimensions is None:
+            continue
+        width, height = dimensions
+        relative = Path(record.original_rel or record.original_path.name).as_posix()
+        images.append({"id": image_id, "file_name": relative, "width": width, "height": height})
+        for class_id, center_x, center_y, box_width, box_height in read_yolo_boxes(record.label_path):
+            x = max(0.0, (center_x - box_width / 2) * width)
+            y = max(0.0, (center_y - box_height / 2) * height)
+            pixel_width = min(width - x, box_width * width)
+            pixel_height = min(height - y, box_height * height)
+            annotations.append(
+                {
+                    "id": annotation_id,
+                    "image_id": image_id,
+                    "category_id": class_id,
+                    "bbox": [round(x, 4), round(y, 4), round(pixel_width, 4), round(pixel_height, 4)],
+                    "area": round(pixel_width * pixel_height, 4),
+                    "iscrowd": 0,
+                }
+            )
+            annotation_id += 1
+    payload = {
+        "info": {"description": "Dataset Image Review export", "version": APP_VERSION},
+        "licenses": [],
+        "images": images,
+        "annotations": annotations,
+        "categories": [
+            {"id": class_id, "name": name, "supercategory": "object"}
+            for class_id, name in enumerate(class_names)
+        ],
+    }
+    path = output_root / "coco" / "annotations.json"
+    return [path] if write_text_if_same(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n") == "conflict" else []
+
+
+def write_cvat_export(output_root: Path, class_names: list[str]) -> list[Path]:
+    files = {
+        output_root / "cvat" / "data.yaml": yolo_dataset_yaml(class_names),
+        output_root / "cvat" / "README.md": (
+            "# CVAT 导入说明\n\n"
+            "此包是 CVAT 的 YOLO/Ultralytics 导入辅助目录，不是 CVAT 原生 XML。"
+            "在 CVAT 导入时选择本目录中的 `images/`、`labels/` 和 `data.yaml`。"
+            "标签为审核后的原始 YOLO 检测框；没有标签的图片仍会保留在 `images/` 中。\n"
+        ),
+    }
+    return [path for path, content in files.items() if write_text_if_same(path, content) == "conflict"]
+
+
+def write_label_studio_export(
+    output_root: Path, records: list[PairRecord], class_names: list[str]
+) -> list[Path]:
+    tasks: list[dict[str, Any]] = []
+    for task_id, record in enumerate(records, start=1):
+        if record.original_path is None:
+            continue
+        relative = Path(record.original_rel or record.original_path.name).as_posix()
+        result: list[dict[str, Any]] = []
+        for annotation_id, (class_id, center_x, center_y, width, height) in enumerate(
+            read_yolo_boxes(record.label_path),
+            start=1,
+        ):
+            label = class_names[class_id] if class_id < len(class_names) else f"class_{class_id}"
+            result.append(
+                {
+                    "id": f"{record.sample_id}-{annotation_id}",
+                    "from_name": "label",
+                    "to_name": "image",
+                    "type": "rectanglelabels",
+                    "value": {
+                        "x": round((center_x - width / 2) * 100, 4),
+                        "y": round((center_y - height / 2) * 100, 4),
+                        "width": round(width * 100, 4),
+                        "height": round(height * 100, 4),
+                        "rotation": 0,
+                        "rectanglelabels": [label],
+                    },
+                }
+            )
+        tasks.append(
+            {
+                "id": task_id,
+                "data": {"image": f"images/{relative}"},
+                "predictions": [{"model_version": "reviewed-preannotation", "result": result}],
+            }
+        )
+    labels = "".join(f'    <Label value="{xml_escape(name)}" />\n' for name in class_names)
+    label_config = (
+        "<View>\n"
+        "  <Image name=\"image\" value=\"$image\" />\n"
+        "  <RectangleLabels name=\"label\" toName=\"image\">\n"
+        f"{labels}"
+        "  </RectangleLabels>\n"
+        "</View>\n"
+    )
+    files = {
+        output_root / "label_studio" / "tasks.json": json.dumps(tasks, ensure_ascii=False, indent=2) + "\n",
+        output_root / "label_studio" / "label_config.xml": label_config,
+        output_root / "label_studio" / "README.md": (
+            "# Label Studio 导入说明\n\n"
+            "此包提供任务 JSON 和矩形框预标注。导入前请将 Label Studio 的本地或文件存储"
+            "配置为可访问本目录 `images/`，因为任务使用 `images/...` 相对路径。\n"
+        ),
+    }
+    return [path for path, content in files.items() if write_text_if_same(path, content) == "conflict"]
+
+
+def write_annotation_guide(
+    output_root: Path,
+    records: list[PairRecord],
+    class_names: list[str],
+    formats: set[str],
+    preflight_report: dict[str, Any] | None,
+) -> list[Path]:
+    guide_root = output_root / "annotation_guide"
+    classes_content = "\n".join(class_names) + "\n"
+    quality_summary = (preflight_report or {}).get("summary", {})
+    quality_lines = (
+        f"- 已预检：{quality_summary.get('total', 0)} 张；"
+        f"损坏：{quality_summary.get('corrupt', 0)}；"
+        f"质量问题：{quality_summary.get('quality_issues', 0)}；"
+        f"重复候选：{quality_summary.get('duplicates', 0)}。\n"
+        if quality_summary
+        else "- 尚未运行质量预检；建议标注团队接收前先运行预检。\n"
+    )
+    class_lines = "\n".join(f"- `{index}`：{name}" for index, name in enumerate(class_names))
+    format_text = "、".join({"yolo": "YOLO", "coco": "COCO", "cvat": "CVAT", "label_studio": "Label Studio"}[item] for item in sorted(formats))
+    guide = (
+        "# 标注任务规范包\n\n"
+        "此目录随审核后的数据一同交付标注团队。所有图片均为复制件；源图片、原始标签和模型可视化图未被移动或修改。\n\n"
+        "## 交付范围\n\n"
+        f"- 已保留样本：{len(records)} 张；导出格式：{format_text}。\n"
+        f"{quality_lines}"
+        "\n## 类别\n\n"
+        f"{class_lines}\n\n"
+        "请在开始标注前确认 `classes.txt` 的类别名称是否符合项目语义；若仍为 `class_N`，"
+        "请由项目负责人替换为正式类别定义后再分发。\n\n"
+        "## 标注规则\n\n"
+        "1. 当前交付仅支持 YOLO 目标检测矩形框；不支持分割多边形或分类标签导出。\n"
+        "2. 只标注项目类别中可清晰辨认的目标；无法判断时不臆测类别。\n"
+        "3. 检测框尽量贴合目标可见边缘，不包含大面积无关背景。\n"
+        "4. 遮挡、截断、反光或极小目标应按项目约定处理，并在质检时重点复核。\n"
+        "5. 已提供的模型框仅是预标注候选，必须由标注员确认、修改或删除。\n"
+        "6. 质量/重复预警样本不应静默丢弃；如需排除，请在任务反馈中保留样本 ID 与原因。\n\n"
+        "## 验收检查\n\n"
+        "- 类别 ID 与 `classes.txt` 一致；\n"
+        "- 框不越界、不为空，且没有明显重复框；\n"
+        "- 图片、标签与任务清单数量可追溯；\n"
+        "- 对有争议的样本记录原因并返回项目方。\n"
+    )
+    manifest_lines = [
+        json.dumps(
+            {
+                "sample_id": record.sample_id,
+                "image": record.original_rel,
+                "label": record.label_rel,
+                "preannotation_available": bool(record.label_path),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        for record in records
+    ]
+    files = {
+        guide_root / "classes.txt": classes_content,
+        guide_root / "README.md": guide,
+        guide_root / "task_manifest.jsonl": "\n".join(manifest_lines) + ("\n" if manifest_lines else ""),
+    }
+    return [path for path, content in files.items() if write_text_if_same(path, content) == "conflict"]
+
+
 def export_dataset(
     records: list[PairRecord],
     store: ReviewStore,
@@ -547,13 +1088,16 @@ def export_dataset(
     include_visualizations: bool = True,
     require_labels: bool = False,
     allow_images_without_labels: bool = False,
+    formats: Iterable[str] | None = None,
+    class_names: Iterable[str] | None = None,
+    preflight_report: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     output_root = canonical_path(output_root)
+    selected_formats = normalize_export_formats(formats)
     exported_ids: set[str] = set()
+    exported_records: list[PairRecord] = []
     conflicts: list[dict[str, str]] = []
     issues: list[dict[str, str]] = []
-    artifacts_created = 0
-    artifacts_same = 0
     for record in records:
         if store.decisions.get(record.sample_id) != "keep":
             continue
@@ -567,15 +1111,22 @@ def export_dataset(
             issues.append({"sample_id": record.sample_id, "reason": "invalid_label"})
             continue
         original_rel = Path(record.original_rel or record.original_path.name)
-        image_destination = output_root / "images" / original_rel
-        artifacts: list[tuple[Path, Path]] = [(record.original_path, image_destination)]
-        if record.label_path is not None:
-            label_destination = output_root / "labels" / original_rel.with_suffix(".txt")
-            artifacts.append((record.label_path, label_destination))
-        if include_visualizations and record.visual_path is not None and record.visual_path.is_file():
+        artifacts: list[tuple[Path, Path]] = []
+        if "yolo" in selected_formats:
+            artifacts.append((record.original_path, output_root / "images" / original_rel))
+            if record.label_path is not None:
+                artifacts.append((record.label_path, output_root / "labels" / original_rel.with_suffix(".txt")))
+        if "coco" in selected_formats:
+            artifacts.append((record.original_path, output_root / "coco" / "images" / original_rel))
+        if "cvat" in selected_formats:
+            artifacts.append((record.original_path, output_root / "cvat" / "images" / original_rel))
+            if record.label_path is not None:
+                artifacts.append((record.label_path, output_root / "cvat" / "labels" / original_rel.with_suffix(".txt")))
+        if "label_studio" in selected_formats:
+            artifacts.append((record.original_path, output_root / "label_studio" / "images" / original_rel))
+        if "yolo" in selected_formats and include_visualizations and record.visual_path is not None and record.visual_path.is_file():
             visual_rel = Path(record.visual_rel or record.visual_path.name)
-            destination = output_root / "visualizations" / visual_rel
-            artifacts.append((record.visual_path, destination))
+            artifacts.append((record.visual_path, output_root / "visualizations" / visual_rel))
 
         try:
             planned, sample_conflicts = preflight_artifacts(artifacts)
@@ -595,14 +1146,11 @@ def export_dataset(
                     raise OSError(f"export target changed during copy: {destination}")
                 if result != expected_status:
                     raise OSError(f"unexpected export status for {destination}: {result}")
-                if result == "created":
-                    artifacts_created += 1
-                else:
-                    artifacts_same += 1
         except OSError as exc:
             issues.append({"sample_id": record.sample_id, "reason": f"copy_error:{exc}"})
             continue
         exported_ids.add(record.sample_id)
+        exported_records.append(record)
 
     manifest_lines: list[str] = []
     for record in records:
@@ -615,15 +1163,37 @@ def export_dataset(
                     "original_image": str(record.original_path) if record.original_path else None,
                     "label_file": str(record.label_path) if record.label_path else None,
                     "decision": decision,
-                    "timestamp": utc_now(),
+                    "timestamp": store.decision_timestamp(record.sample_id),
                     "exported": record.sample_id in exported_ids,
                     "anomalies": record.anomalies,
+                    "formats": sorted(selected_formats),
                 },
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
         )
-    atomic_write_text(output_root / "review_manifest.jsonl", "\n".join(manifest_lines) + ("\n" if manifest_lines else ""))
+    metadata_conflict_paths: list[Path] = []
+    manifest_path = output_root / "review_manifest.jsonl"
+    if write_text_if_same(manifest_path, "\n".join(manifest_lines) + ("\n" if manifest_lines else "")) == "conflict":
+        metadata_conflict_paths.append(manifest_path)
+    names = resolved_class_names(exported_records, class_names)
+    if "yolo" in selected_formats:
+        data_yaml = output_root / "data.yaml"
+        if write_text_if_same(data_yaml, yolo_dataset_yaml(names)) == "conflict":
+            metadata_conflict_paths.append(data_yaml)
+    if "coco" in selected_formats:
+        metadata_conflict_paths.extend(write_coco_export(output_root, exported_records, names))
+    if "cvat" in selected_formats:
+        metadata_conflict_paths.extend(write_cvat_export(output_root, names))
+    if "label_studio" in selected_formats:
+        metadata_conflict_paths.extend(write_label_studio_export(output_root, exported_records, names))
+    metadata_conflict_paths.extend(
+        write_annotation_guide(output_root, exported_records, names, selected_formats, preflight_report)
+    )
+    conflicts.extend(
+        {"sample_id": "__metadata__", "path": str(path)}
+        for path in sorted(set(metadata_conflict_paths))
+    )
     summary = {
         "app_version": APP_VERSION,
         "exported": len(exported_ids),
@@ -633,15 +1203,27 @@ def export_dataset(
         "unreviewed": sum(record.sample_id not in store.decisions for record in records),
         "conflicts": conflicts,
         "issues": issues,
-        "artifacts_created": artifacts_created,
-        "artifacts_unchanged": artifacts_same,
+        "artifacts_total": sum(
+            1
+            + int("yolo" in selected_formats and record.label_path is not None)
+            + int("yolo" in selected_formats and include_visualizations and record.visual_path is not None)
+            + int("coco" in selected_formats)
+            + int("cvat" in selected_formats)
+            + int("cvat" in selected_formats and record.label_path is not None)
+            + int("label_studio" in selected_formats)
+            for record in exported_records
+        ),
+        "formats": sorted(selected_formats),
+        "annotation_guide": str(output_root / "annotation_guide"),
         "output_root": str(output_root),
-        "timestamp": utc_now(),
+        "decision_state_timestamp": max(
+            [store.decision_timestamp(record.sample_id) for record in records]
+            or ["1970-01-01T00:00:00+00:00"]
+        ),
     }
-    atomic_write_text(
-        output_root / "export_summary.json",
-        json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
-    )
+    summary_path = output_root / "export_summary.json"
+    if write_text_if_same(summary_path, json.dumps(summary, ensure_ascii=False, indent=2) + "\n") == "conflict":
+        conflicts.append({"sample_id": "__metadata__", "path": str(summary_path)})
     return summary
 
 
@@ -667,11 +1249,12 @@ HTML_PAGE = r"""<!doctype html>
 body { margin:0; min-height:100vh; font:14px/1.45 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif; background:linear-gradient(135deg,#0b1220,#172033 55%,#111827); color:var(--text); }
 header { padding:18px 24px 10px; display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; }
 h1 { margin:0; font-size:22px; letter-spacing:.02em; }
-button, select, input { border:1px solid var(--line); background:var(--panel2); color:var(--text); border-radius:8px; padding:9px 13px; }
+button, select, input, textarea { border:1px solid var(--line); background:var(--panel2); color:var(--text); border-radius:8px; padding:9px 13px; }
 button { cursor:pointer; }
 button:hover { border-color:#7dd3fc; transform:translateY(-1px); }
 button.primary { background:#166534; border-color:#22c55e; }
 button.reject { background:#7f1d1d; border-color:#ef4444; }
+button.audit { background:#164e63; border-color:#22d3ee; }
 button:disabled { opacity:.45; cursor:not-allowed; transform:none; }
 [hidden] { display:none !important; }
 .layout { max-width:1500px; margin:auto; padding:0 24px 24px; }
@@ -684,9 +1267,14 @@ button:disabled { opacity:.45; cursor:not-allowed; transform:none; }
 .setup-grid { display:grid; grid-template-columns:1fr auto; gap:10px; align-items:center; }
 .setup-grid label { grid-column:1 / -1; color:var(--muted); font-size:12px; margin-top:4px; }
 .setup-grid input { min-width:0; width:100%; }
+.setup-grid textarea { grid-column:1 / -1; width:100%; min-height:76px; resize:vertical; font:inherit; }
 .setup-options { display:flex; gap:12px; flex-wrap:wrap; margin:18px 0; color:var(--muted); }
 .setup-options label { display:flex; align-items:center; gap:6px; }
 .setup-options input { accent-color:var(--accent); }
+.export-options { display:flex; gap:7px; align-items:center; flex-wrap:wrap; padding:6px 8px; border-left:1px solid var(--line); }
+.export-options strong { color:#a5f3fc; font-size:12px; letter-spacing:.06em; text-transform:uppercase; }
+.export-options label { display:flex; align-items:center; gap:4px; color:var(--muted); font-size:12px; }
+.export-options input { accent-color:#22d3ee; }
 .stats { display:grid; grid-template-columns:repeat(6,minmax(100px,1fr)); gap:8px; margin-bottom:12px; }
 .stat { background:rgba(39,52,73,.75); padding:9px 12px; border-radius:8px; }
 .stat b { display:block; font-size:20px; }
@@ -714,8 +1302,8 @@ button:disabled { opacity:.45; cursor:not-allowed; transform:none; }
     <h2>选择本机文件夹</h2>
     <p>点击按钮会打开当前电脑的系统目录选择器。路径只在本机审核服务中使用，不会上传到云端。</p>
     <div class="setup-grid">
-      <label for="visualRoot">模型可视化图文件夹（必选）</label>
-      <input id="visualRoot" readonly placeholder="请选择包含检测框或掩码可视化图的文件夹">
+      <label for="visualRoot">模型可视化图文件夹（可选）</label>
+      <input id="visualRoot" readonly placeholder="如有模型预标注可视化图则选择；否则可留空">
       <button data-directory="visual_root">选择文件夹</button>
       <label for="originalRoot">原图文件夹（必选）</label>
       <input id="originalRoot" readonly placeholder="请选择对应原始图片文件夹">
@@ -726,21 +1314,31 @@ button:disabled { opacity:.45; cursor:not-allowed; transform:none; }
       <label for="outputRoot">导出数据集文件夹（必选）</label>
       <input id="outputRoot" readonly placeholder="请选择一个已有的导出父目录">
       <button data-directory="output_root">选择文件夹</button>
+      <label for="classNames">类别名称（可选，每行一个；用于标注规范和平台格式）</label>
+      <textarea id="classNames" placeholder="例如：&#10;plastic_bottle&#10;paper_cup&#10;other_waste"></textarea>
     </div>
     <div class="setup-options">
       <label><input id="candidateOnly" type="checkbox"> 仅审核有模型可视化图的候选样本</label>
       <label><input id="includeVisualizations" type="checkbox" checked> 导出可视化图</label>
-      <label><input id="allowImagesWithoutLabels" type="checkbox"> 允许导出无标签图片</label>
+      <label><input id="allowImagesWithoutLabels" type="checkbox" checked> 允许导出无标签图片</label>
     </div>
     <button class="primary" id="configure">确认文件夹并开始审核</button>
-    <div class="statusbar" id="setupStatus">请依次选择模型图、原图和导出文件夹。</div>
+    <div class="statusbar" id="setupStatus">请选择原图和导出文件夹；模型预标注图、YOLO 标签均可留空。</div>
   </section>
   <div id="reviewUi" hidden>
   <div class="toolbar">
-    <label>筛选 <select id="filter"><option value="all">全部</option><option value="unreviewed">未审核</option><option value="keep">已保留</option><option value="reject">已排除</option><option value="skip">已跳过</option><option value="error">配对异常</option></select></label>
+    <label>筛选 <select id="filter"><option value="all">全部</option><option value="unreviewed">未审核</option><option value="keep">已保留</option><option value="reject">已排除</option><option value="skip">已跳过</option><option value="error">配对异常</option><option value="quality">质量问题</option><option value="duplicate">重复候选</option></select></label>
     <button id="prev">上一张</button><button id="next">下一张</button>
     <button class="primary" data-decision="keep">保留</button><button class="reject" data-decision="reject">不保留</button><button data-decision="skip">跳过</button><button id="undo">撤销</button>
-    <span class="spacer"></span><button id="zoomOut">−</button><button id="zoomReset">100%</button><button id="zoomIn">＋</button><button id="chooseFolders">重新选择文件夹</button><button id="rescan">重新扫描</button><button id="export">导出数据集</button>
+    <span class="spacer"></span><button class="audit" id="preflight">质量预检</button><button id="rejectDuplicates">拒绝重复候选</button><button id="zoomOut">−</button><button id="zoomReset">100%</button><button id="zoomIn">＋</button><button id="chooseFolders">重新选择文件夹</button><button id="rescan">重新扫描</button>
+    <div class="export-options">
+      <strong>交付</strong>
+      <label><input id="formatYolo" type="checkbox" checked> YOLO</label>
+      <label><input id="formatCoco" type="checkbox"> COCO</label>
+      <label><input id="formatCvat" type="checkbox"> CVAT</label>
+      <label><input id="formatLabelStudio" type="checkbox"> Label Studio</label>
+      <button id="export">导出标注包</button>
+    </div>
   </div>
   <div class="stats" id="stats"></div>
   <div class="pair">
@@ -752,7 +1350,7 @@ button:disabled { opacity:.45; cursor:not-allowed; transform:none; }
   </div>
 </main>
 <script>
-const state = { ready: false, records: [], decisions: {}, stats: {}, filter: "all", cursor: 0, scale: 1, detail: null };
+const state = { ready: false, records: [], decisions: {}, stats: {}, preflight: {completed:false,summary:{}}, filter: "all", cursor: 0, scale: 1, detail: null };
 const $ = id => document.getElementById(id);
 const inputForDirectory = { visual_root: "visualRoot", original_root: "originalRoot", label_root: "labelRoot", output_root: "outputRoot" };
 function setSetupStatus(message, error=false) { $("setupStatus").textContent = message; $("setupStatus").style.color = error ? "#fca5a5" : "#bfdbfe"; }
@@ -768,6 +1366,7 @@ function fillSetup(config) {
     $("candidateOnly").checked = !!config.candidate_only;
     $("includeVisualizations").checked = config.include_visualizations !== false;
     $("allowImagesWithoutLabels").checked = !!config.allow_images_without_labels;
+    $("classNames").value = (config.class_names || []).join("\n");
   }
 }
 async function chooseDirectory(field) {
@@ -781,12 +1380,13 @@ async function chooseDirectory(field) {
 }
 async function configureReview() {
   const visualRoot = $("visualRoot").value, originalRoot = $("originalRoot").value, outputRoot = $("outputRoot").value;
-  if (!visualRoot || !originalRoot || !outputRoot) { setSetupStatus("请先选择模型图、原图和导出文件夹。", true); return; }
+  if (!originalRoot || !outputRoot) { setSetupStatus("请先选择原图和导出文件夹。模型预标注图和标签均可留空。", true); return; }
   setSetupStatus("正在扫描并建立审核列表…");
   const response = await fetch("/api/configure", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({
-    visual_root: visualRoot, original_root: originalRoot, label_root: $("labelRoot").value || null, output_root: outputRoot,
+    visual_root: visualRoot || null, original_root: originalRoot, label_root: $("labelRoot").value || null, output_root: outputRoot,
     candidate_only: $("candidateOnly").checked, include_visualizations: $("includeVisualizations").checked,
-    allow_images_without_labels: $("allowImagesWithoutLabels").checked
+    allow_images_without_labels: $("allowImagesWithoutLabels").checked,
+    class_names: $("classNames").value.split(/\r?\n/).map(name => name.trim()).filter(Boolean)
   })});
   const payload = await response.json();
   if (!response.ok) { setSetupStatus(payload.error || "配置失败", true); return; }
@@ -797,6 +1397,8 @@ function currentList() {
     const d = state.decisions[r.sample_id];
     if (state.filter === "all") return true;
     if (state.filter === "error") return r.has_error;
+    if (state.filter === "quality") return r.has_preflight_issue;
+    if (state.filter === "duplicate") return r.is_duplicate;
     if (state.filter === "unreviewed") return !d;
     return d === state.filter;
   });
@@ -805,8 +1407,8 @@ function current() { const list = currentList(); return list[state.cursor] || li
 function setStatus(message, error=false) { $("status").textContent = message; $("status").style.color = error ? "#fca5a5" : "#bfdbfe"; }
 function esc(text) { const div = document.createElement("div"); div.textContent = text ?? ""; return div.innerHTML; }
 function renderStats() {
-  const s = state.stats;
-  $("stats").innerHTML = [["total","总图片"],["reviewed","已审核"],["keep","保留"],["reject","排除"],["skip","跳过"],["anomalies","异常"]].map(([k,n]) => `<div class="stat"><b>${s[k] ?? 0}</b><span>${n}</span></div>`).join("");
+  const s = {...state.stats, ...(state.preflight.summary || {})};
+  $("stats").innerHTML = [["total","总图片"],["reviewed","已审核"],["keep","保留"],["reject","排除"],["skip","跳过"],["anomalies","异常"],["quality_issues","质量问题"],["duplicates","重复候选"]].map(([k,n]) => `<div class="stat"><b>${s[k] ?? 0}</b><span>${n}</span></div>`).join("");
 }
 function fileUrl(kind, rel) { return rel ? `/files/${kind}/${encodeURIComponent(rel)}` : ""; }
 function renderStage(id, kind, rel, alt) {
@@ -833,9 +1435,16 @@ async function render() {
   await loadDetail(record);
   const d = state.decisions[record.sample_id] || "未审核";
   document.querySelector('[data-decision="keep"]').disabled = !record.original_rel;
-  renderStage("visualStage", "visual", record.visual_rel, "模型可视化图");
+  renderStage("visualStage", "visual", record.visual_rel, record.visual_rel ? "模型可视化图" : "未提供模型预标注可视化图");
   renderStage("originalStage", "original", record.original_rel, "原图");
   const detail = state.detail || {};
+  const preflight = detail.preflight || record.preflight;
+  const preflightText = !state.preflight.completed ? "未运行" : (
+    preflight ? [
+      ...(preflight.issues || []),
+      preflight.duplicate ? `${preflight.duplicate.kind === "exact" ? "精确" : "近似"}重复` : ""
+    ].filter(Boolean).join("；") || "通过" : "未找到"
+  );
   $("info").innerHTML = [
     ["进度", `${state.cursor + 1} / ${list.length}（总计 ${state.records.length}）`],
     ["文件名", record.visual_rel || record.original_rel || "未知"],
@@ -845,6 +1454,7 @@ async function render() {
     ["审核状态", d],
     ["样本 ID", record.sample_id],
     ["配对状态", record.anomalies.length ? `<span class="warning">${esc(record.anomalies.join(", "))}</span>` : "正常"],
+    ["质量预检", preflightText === "通过" ? preflightText : `<span class="warning">${esc(preflightText)}</span>`],
   ].map(([k,v]) => `<div><div class="label">${k}</div><div class="value">${v}</div></div>`).join("");
   setStatus(`当前：${record.visual_rel || record.original_rel} · ${d} · 缩放 ${Math.round(state.scale*100)}%`);
 }
@@ -856,7 +1466,7 @@ async function reload(existingPayload=null) {
   fillSetup(payload.config);
   if (!state.ready) { showSetup(); return; }
   showReview();
-  state.records = payload.records; state.decisions = payload.decisions; state.stats = payload.stats;
+  state.records = payload.records; state.decisions = payload.decisions; state.stats = payload.stats; state.preflight = payload.preflight || {completed:false,summary:{}};
   const list = currentList(); if (state.cursor >= list.length) state.cursor = Math.max(0, list.length - 1);
   await render();
 }
@@ -875,11 +1485,35 @@ async function undo() {
   state.decisions = payload.decisions; state.stats = payload.stats; await render(); setStatus(`已撤销：${payload.sample_id || "无可撤销操作"}`);
 }
 async function exportData() {
-  setStatus("正在导出保留样本…");
-  const response = await fetch("/api/export", {method:"POST"});
+  const formats = [
+    $("formatYolo").checked && "yolo",
+    $("formatCoco").checked && "coco",
+    $("formatCvat").checked && "cvat",
+    $("formatLabelStudio").checked && "label_studio",
+  ].filter(Boolean);
+  if (!formats.length) { setStatus("请至少选择一种导出格式。", true); return; }
+  setStatus(`正在生成 ${formats.join(" / ")} 标注交付包…`);
+  const response = await fetch("/api/export", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({formats})});
   const payload = await response.json();
   if (!response.ok) { setStatus(payload.error || "导出失败", true); return; }
-  setStatus(`导出完成：${payload.exported} 个样本；冲突 ${payload.conflicts.length}；问题 ${payload.issues.length}`);
+  setStatus(`导出完成：${payload.exported} 个样本；格式 ${payload.formats.join(" / ")}；标注规范包已生成；冲突 ${payload.conflicts.length}；问题 ${payload.issues.length}`);
+}
+async function runPreflight() {
+  setStatus("正在逐张执行质量与重复预检…");
+  const response = await fetch("/api/preflight", {method:"POST"});
+  const payload = await response.json();
+  if (!response.ok) { setStatus(payload.error || "质量预检失败", true); return; }
+  await reload(payload);
+  const summary = payload.preflight.summary || {};
+  setStatus(`预检完成：损坏 ${summary.corrupt || 0}；质量问题 ${summary.quality_issues || 0}；重复候选 ${summary.duplicates || 0}。报告已保存到导出目录。`);
+}
+async function rejectDuplicates() {
+  if (!state.preflight.completed) { setStatus("请先运行质量预检，再批量处理重复候选。", true); return; }
+  const response = await fetch("/api/reject-duplicates", {method:"POST"});
+  const payload = await response.json();
+  if (!response.ok) { setStatus(payload.error || "批量处理失败", true); return; }
+  state.decisions = payload.decisions; state.stats = payload.stats;
+  await render(); setStatus(`已将 ${payload.affected} 个重复候选标记为不保留；仅修改审核状态，可逐条撤销。`);
 }
 document.querySelectorAll("[data-decision]").forEach(button => button.onclick = () => decide(button.dataset.decision));
 document.querySelectorAll("[data-directory]").forEach(button => button.onclick = () => chooseDirectory(button.dataset.directory));
@@ -887,6 +1521,8 @@ $("configure").onclick = configureReview;
 $("prev").onclick = () => { state.cursor = Math.max(0, state.cursor - 1); render(); };
 $("next").onclick = () => { state.cursor = Math.min(currentList().length - 1, state.cursor + 1); render(); };
 $("undo").onclick = undo; $("export").onclick = exportData;
+$("preflight").onclick = runPreflight;
+$("rejectDuplicates").onclick = rejectDuplicates;
 $("chooseFolders").onclick = () => showSetup("重新选择并确认文件夹会切换到新的审核会话；源文件不会被修改。");
 $("rescan").onclick = async () => {
   const response = await fetch("/api/rescan", {method:"POST"});
@@ -921,8 +1557,9 @@ class ReviewApplication:
         store: ReviewStore | None = None,
         output_root: Path | None = None,
         include_visualizations: bool = True,
-        allow_images_without_labels: bool = False,
+        allow_images_without_labels: bool = True,
         candidate_only: bool = False,
+        class_names: Iterable[str] | None = None,
         instance_id: str | None = None,
     ) -> None:
         if (engine is None) != (store is None) or (engine is None) != (output_root is None):
@@ -933,9 +1570,24 @@ class ReviewApplication:
         self.include_visualizations = include_visualizations
         self.allow_images_without_labels = allow_images_without_labels
         self.candidate_only = candidate_only
+        self.class_names = [str(name).strip() for name in class_names or () if str(name).strip()]
         self.instance_id = instance_id or uuid.uuid4().hex
         self.lock = threading.RLock()
         self.records = self.engine.scan() if self.engine is not None else []
+        self.preflight_report = (
+            load_matching_preflight_report(self.output_root, self.records)
+            if self.output_root is not None
+            else None
+        )
+        self.preflight_by_sample_id = self._preflight_index(self.preflight_report)
+
+    @staticmethod
+    def _preflight_index(report: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+        return {
+            item["sample_id"]: item
+            for item in (report or {}).get("samples", [])
+            if isinstance(item, dict) and isinstance(item.get("sample_id"), str)
+        }
 
     @property
     def ready(self) -> bool:
@@ -951,25 +1603,24 @@ class ReviewApplication:
 
     def configure_from_directories(
         self,
-        visual_root: Path,
+        visual_root: Path | None,
         original_root: Path,
         output_root: Path,
         label_root: Path | None = None,
         manifest_path: Path | None = None,
         candidate_only: bool = False,
         include_visualizations: bool = True,
-        allow_images_without_labels: bool = False,
+        allow_images_without_labels: bool = True,
+        class_names: Iterable[str] | None = None,
     ) -> None:
-        visual_root = canonical_path(visual_root)
+        visual_root = canonical_path(visual_root) if visual_root is not None else None
         original_root = canonical_path(original_root)
         output_root = canonical_path(output_root)
         label_root = canonical_path(label_root) if label_root is not None else None
         manifest_path = canonical_path(manifest_path) if manifest_path is not None else None
-        for name, path in (("可视化图文件夹", visual_root), ("原图文件夹", original_root)):
-            if not path.is_dir():
-                raise ValueError(f"{name}不存在或不是目录: {path}")
-        if label_root is not None and not label_root.is_dir():
-            raise ValueError(f"标签文件夹不存在或不是目录: {label_root}")
+        if candidate_only and visual_root is None:
+            raise ValueError("仅审核候选样本时必须提供模型可视化图文件夹")
+        validate_input_roots(visual_root, original_root, output_root, label_root)
         if manifest_path is not None and not manifest_path.is_file():
             raise ValueError(f"配对清单不存在或不是文件: {manifest_path}")
 
@@ -989,12 +1640,37 @@ class ReviewApplication:
             self.include_visualizations = include_visualizations
             self.allow_images_without_labels = allow_images_without_labels
             self.candidate_only = candidate_only
+            self.class_names = [str(name).strip() for name in class_names or () if str(name).strip()]
             self.records = records
+            self.preflight_report = load_matching_preflight_report(output_root, records)
+            self.preflight_by_sample_id = self._preflight_index(self.preflight_report)
 
     def rescan(self) -> None:
         engine, _, _ = self.require_ready()
         with self.lock:
             self.records = engine.scan()
+            assert self.output_root is not None
+            self.preflight_report = load_matching_preflight_report(self.output_root, self.records)
+            self.preflight_by_sample_id = self._preflight_index(self.preflight_report)
+
+    def run_quality_preflight(self) -> dict[str, Any]:
+        _, _, output_root = self.require_ready()
+        report = run_preflight(list(self.records))
+        report_content = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
+        if write_text_if_same(output_root / "preflight_report.json", report_content) == "conflict":
+            raise ValueError("已有 preflight_report.json 内容不同；请使用新的导出目录或先人工核对该报告")
+        with self.lock:
+            self.preflight_report = report
+            self.preflight_by_sample_id = self._preflight_index(report)
+        return report
+
+    def record_payload(self, record: PairRecord, store: ReviewStore) -> dict[str, Any]:
+        payload = record.to_dict(store.decisions.get(record.sample_id))
+        preflight = self.preflight_by_sample_id.get(record.sample_id)
+        payload["preflight"] = preflight
+        payload["has_preflight_issue"] = bool(preflight and preflight.get("issues"))
+        payload["is_duplicate"] = bool(preflight and preflight.get("duplicate"))
+        return payload
 
     def set_decision(self, sample_id: str, decision: str) -> None:
         _, store, _ = self.require_ready()
@@ -1005,6 +1681,23 @@ class ReviewApplication:
             if decision == "keep" and (record.original_path is None or not record.original_path.is_file()):
                 raise ValueError("缺失原图的样本不能保留")
             store.set_decision(sample_id, decision)
+
+    def reject_duplicate_candidates(self) -> int:
+        """Mark only non-representative duplicate candidates as rejected."""
+        _, store, _ = self.require_ready()
+        with self.lock:
+            if self.preflight_report is None:
+                raise ValueError("请先运行质量预检")
+            record_ids = {record.sample_id for record in self.records}
+            duplicate_ids = [
+                sample["sample_id"]
+                for sample in self.preflight_report.get("samples", [])
+                if isinstance(sample, dict)
+                and isinstance(sample.get("sample_id"), str)
+                and sample.get("sample_id") in record_ids
+                and isinstance(sample.get("duplicate"), dict)
+            ]
+            return store.set_decisions(duplicate_ids, "reject")
 
     def state_payload(self) -> dict[str, Any]:
         with self.lock:
@@ -1024,24 +1717,31 @@ class ReviewApplication:
                         "candidate_only": self.candidate_only,
                         "include_visualizations": self.include_visualizations,
                         "allow_images_without_labels": self.allow_images_without_labels,
+                        "class_names": self.class_names,
                     },
+                    "preflight": {"completed": False, "summary": {}},
                 }
             engine, store, output_root = self.require_ready()
             return {
                 "app_version": APP_VERSION,
                 "instance_id": self.instance_id,
                 "ready": True,
-                "records": [record.to_dict(store.decisions.get(record.sample_id)) for record in self.records],
+                "records": [self.record_payload(record, store) for record in self.records],
                 "decisions": dict(store.decisions),
                 "stats": store.stats(self.records),
                 "config": {
-                    "visual_root": str(engine.visual_root),
+                    "visual_root": str(engine.visual_root) if engine.visual_root else None,
                     "original_root": str(engine.original_root),
                     "label_root": str(engine.label_root) if engine.label_root else None,
                     "output_root": str(output_root),
                     "candidate_only": self.candidate_only,
                     "include_visualizations": self.include_visualizations,
                     "allow_images_without_labels": self.allow_images_without_labels,
+                    "class_names": self.class_names,
+                },
+                "preflight": {
+                    "completed": self.preflight_report is not None,
+                    "summary": (self.preflight_report or {}).get("summary", {}),
                 },
             }
 
@@ -1054,6 +1754,7 @@ class ReviewApplication:
                         **record.to_dict(store.decisions.get(sample_id)),
                         "visual_dimensions": read_dimensions(record.visual_path),
                         "original_dimensions": read_dimensions(record.original_path),
+                        "preflight": self.preflight_by_sample_id.get(sample_id),
                     }
         return None
 
@@ -1125,6 +1826,9 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             return
         engine, _, _ = self.application.require_ready()
         root = engine.visual_root if parts[2] == "visual" else engine.original_root
+        if root is None:
+            self.send_json({"error": "未配置模型可视化图文件夹"}, 404)
+            return
         relative = Path(parts[3])
         file_path = (root / relative).resolve()
         if not is_inside(file_path, root) or not file_path.is_file() or file_path.suffix.lower() not in IMAGE_SUFFIXES:
@@ -1174,15 +1878,22 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                         raise ValueError(f"{key} 必须是 true 或 false")
                     return value
 
+                def string_list(key: str) -> list[str]:
+                    value = payload.get(key, [])
+                    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+                        raise ValueError(f"{key} 必须是字符串数组")
+                    return [item.strip() for item in value if item.strip()]
+
                 self.application.configure_from_directories(
-                    required_path("visual_root"),
+                    optional_path("visual_root"),
                     required_path("original_root"),
                     required_path("output_root"),
                     label_root=optional_path("label_root"),
                     manifest_path=optional_path("manifest"),
                     candidate_only=boolean("candidate_only", False),
                     include_visualizations=boolean("include_visualizations", True),
-                    allow_images_without_labels=boolean("allow_images_without_labels", False),
+                    allow_images_without_labels=boolean("allow_images_without_labels", True),
+                    class_names=string_list("class_names"),
                 )
                 self.send_json(self.application.state_payload())
                 return
@@ -1208,17 +1919,39 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
                     }
                 )
                 return
+            if parsed.path == "/api/reject-duplicates":
+                affected = self.application.reject_duplicate_candidates()
+                _, store, _ = self.application.require_ready()
+                self.send_json(
+                    {
+                        "affected": affected,
+                        "decisions": dict(store.decisions),
+                        "stats": store.stats(self.application.records),
+                    }
+                )
+                return
             if parsed.path == "/api/export":
                 engine, store, output_root = self.application.require_ready()
+                payload = self.read_json()
+                formats = payload.get("formats", ["yolo"])
+                if not isinstance(formats, list) or not all(isinstance(item, str) for item in formats):
+                    raise ValueError("formats 必须是字符串数组")
                 summary = export_dataset(
                     self.application.records,
                     store,
                     output_root,
                     include_visualizations=self.application.include_visualizations,
-                    require_labels=engine.label_root is not None,
+                    require_labels=not self.application.allow_images_without_labels,
                     allow_images_without_labels=self.application.allow_images_without_labels,
+                    formats=formats,
+                    class_names=self.application.class_names,
+                    preflight_report=self.application.preflight_report,
                 )
                 self.send_json(summary)
+                return
+            if parsed.path == "/api/preflight":
+                self.application.run_quality_preflight()
+                self.send_json(self.application.state_payload())
                 return
             if parsed.path == "/api/rescan":
                 self.application.rescan()
@@ -1239,7 +1972,7 @@ class ReviewServer(http.server.ThreadingHTTPServer):
 
     def select_directory(self, field: str) -> Path | None:
         titles = {
-            "visual_root": "选择模型可视化图文件夹",
+            "visual_root": "选择模型可视化图文件夹（可选）",
             "original_root": "选择原图文件夹",
             "label_root": "选择 YOLO 标签文件夹（可取消）",
             "output_root": "选择导出数据集文件夹",
@@ -1263,7 +1996,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--no-visualizations", action="store_true", help="导出时不复制模型可视化图")
-    parser.add_argument("--allow-images-without-labels", action="store_true", help="允许无标签样本仅复制图片")
+    parser.set_defaults(allow_images_without_labels=True)
+    parser.add_argument(
+        "--require-labels",
+        dest="allow_images_without_labels",
+        action="store_false",
+        help="仅导出有 YOLO 标签的保留样本",
+    )
+    parser.add_argument(
+        "--allow-images-without-labels",
+        dest="allow_images_without_labels",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--class-name",
+        action="append",
+        default=[],
+        help="类别名称；可重复提供，顺序与 YOLO class ID 一致",
+    )
     parser.add_argument(
         "--candidate-only",
         action="store_true",
@@ -1281,7 +2032,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     try:
-        configured_roots = (args.visual_root, args.original_root, args.output_root)
+        configured_roots = (args.original_root, args.output_root)
         if args.web_setup:
             if args.host != "127.0.0.1":
                 raise ValueError("网页文件夹选择模式仅允许监听 127.0.0.1")
@@ -1289,18 +2040,12 @@ def main() -> int:
         else:
             if any(path is None for path in configured_roots):
                 raise ValueError(
-                    "visual-root、original-root 和 output-root 必须同时提供；"
+                    "original-root 和 output-root 必须同时提供；模型可视化图和 YOLO 标签可选。"
                     "或使用 --web-setup 在网页中选择文件夹"
                 )
-            assert args.visual_root is not None
             assert args.original_root is not None
             assert args.output_root is not None
-            if not args.visual_root.is_dir():
-                raise ValueError(f"visual-root 不存在或不是目录: {args.visual_root}")
-            if not args.original_root.is_dir():
-                raise ValueError(f"original-root 不存在或不是目录: {args.original_root}")
-            if args.label_root and not args.label_root.is_dir():
-                raise ValueError(f"label-root 不存在或不是目录: {args.label_root}")
+            validate_input_roots(args.visual_root, args.original_root, args.output_root, args.label_root)
             state_file = args.state_file or (args.output_root / ".review_state.json")
             engine = PairingEngine(
                 args.visual_root,
@@ -1316,6 +2061,7 @@ def main() -> int:
                 include_visualizations=not args.no_visualizations,
                 allow_images_without_labels=args.allow_images_without_labels,
                 candidate_only=args.candidate_only,
+                class_names=args.class_name,
                 instance_id=args.instance_id,
             )
     except (OSError, ValueError, json.JSONDecodeError) as exc:

@@ -11,7 +11,7 @@ import zipfile
 
 
 PACKAGE_ROOT = "dataset-image-review"
-PACKAGE_VERSION = "1.2.0"
+PACKAGE_VERSION = "1.3.0"
 SOURCE_DIR = Path(__file__).resolve().parent
 PACKAGE_FILES = (
     ("app.py", "app.py"),

@@ -71,6 +71,7 @@ class PortableConfigTests(unittest.TestCase):
                         "candidate_only": True,
                         "include_visualizations": False,
                         "allow_images_without_labels": True,
+                        "class_names": ["bottle", "cup"],
                         "port": 9876,
                     }
                 ),
@@ -86,8 +87,26 @@ class PortableConfigTests(unittest.TestCase):
             self.assertIn(str((root / "output").resolve()), command)
             self.assertIn("--candidate-only", command)
             self.assertIn("--no-visualizations", command)
-            self.assertIn("--allow-images-without-labels", command)
+            self.assertNotIn("--require-labels", command)
+            self.assertEqual(
+                [command[index + 1] for index, item in enumerate(command) if item == "--class-name"],
+                ["bottle", "cup"],
+            )
             self.assertEqual(command[command.index("--port") + 1], "9876")
+
+    def test_original_only_config_does_not_require_or_emit_visual_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config.json"
+            config_path.write_text(
+                json.dumps({"original_root": "input/original", "output_root": "output"}),
+                encoding="utf-8",
+            )
+
+            command = build_app_command(root / "app.py", load_config(config_path))
+
+            self.assertNotIn("--visual-root", command)
+            self.assertIn(str((root / "input/original").resolve()), command)
 
     def test_rejects_hosts_the_local_http_server_cannot_bind(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

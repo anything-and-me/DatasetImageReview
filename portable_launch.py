@@ -16,15 +16,17 @@ import webbrowser
 import uuid
 
 
-REQUIRED_PATH_KEYS = ("visual_root", "original_root", "output_root")
-OPTIONAL_PATH_KEYS = ("label_root", "manifest", "state_file")
+REQUIRED_PATH_KEYS = ("original_root", "output_root")
+OPTIONAL_PATH_KEYS = ("visual_root", "label_root", "manifest", "state_file")
 BOOLEAN_KEYS = ("candidate_only", "include_visualizations", "allow_images_without_labels")
+LIST_KEYS = ("class_names",)
 DEFAULTS: dict[str, Any] = {
     "host": "127.0.0.1",
     "port": 8765,
     "candidate_only": False,
     "include_visualizations": True,
-    "allow_images_without_labels": False,
+    "allow_images_without_labels": True,
+    "class_names": [],
 }
 LOOPBACK_HOSTS = {"127.0.0.1"}
 
@@ -52,6 +54,7 @@ def load_config(config_path: Path) -> dict[str, Any]:
         *REQUIRED_PATH_KEYS,
         *OPTIONAL_PATH_KEYS,
         *BOOLEAN_KEYS,
+        *LIST_KEYS,
         "host",
         "port",
     }
@@ -77,6 +80,11 @@ def load_config(config_path: Path) -> dict[str, Any]:
     for key in BOOLEAN_KEYS:
         if not isinstance(config[key], bool):
             raise ValueError(f"配置项 {key} 必须是 true 或 false")
+    for key in LIST_KEYS:
+        if not isinstance(config[key], list) or not all(
+            isinstance(item, str) and item.strip() for item in config[key]
+        ):
+            raise ValueError(f"配置项 {key} 必须是非空字符串数组")
 
     host = config["host"]
     if not isinstance(host, str) or host not in LOOPBACK_HOSTS:
@@ -92,8 +100,6 @@ def build_app_command(app_path: Path, config: dict[str, Any]) -> list[str]:
     command = [
         sys.executable,
         str(app_path.resolve()),
-        "--visual-root",
-        config["visual_root"],
         "--original-root",
         config["original_root"],
         "--output-root",
@@ -103,6 +109,8 @@ def build_app_command(app_path: Path, config: dict[str, Any]) -> list[str]:
         "--port",
         str(config["port"]),
     ]
+    if config["visual_root"]:
+        command[2:2] = ["--visual-root", config["visual_root"]]
     for setting, argument in (
         ("label_root", "--label-root"),
         ("manifest", "--manifest"),
@@ -114,8 +122,10 @@ def build_app_command(app_path: Path, config: dict[str, Any]) -> list[str]:
         command.append("--candidate-only")
     if not config["include_visualizations"]:
         command.append("--no-visualizations")
-    if config["allow_images_without_labels"]:
-        command.append("--allow-images-without-labels")
+    if not config["allow_images_without_labels"]:
+        command.append("--require-labels")
+    for class_name in config["class_names"]:
+        command.extend(("--class-name", class_name))
     return command
 
 
