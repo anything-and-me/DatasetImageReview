@@ -1,0 +1,13 @@
+{
+  "visual_root": "path/to/visualizations",
+  "original_root": "path/to/originals",
+  "label_root": null,
+  "output_root": "path/to/review-export",
+  "state_file": null,
+  "manifest": null,
+  "candidate_only": false,
+  "include_visualizations": true,
+  "allow_images_without_labels": false,
+  "host": "127.0.0.1",
+  "port": 8765
+}
