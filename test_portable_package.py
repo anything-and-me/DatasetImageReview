@@ -20,12 +20,13 @@ try:
     )
     from tools.dataset_image_review.portable_launch import (
         build_app_command,
+        build_web_setup_command,
         load_config,
         wait_for_application,
     )
 except ModuleNotFoundError:
     from build_portable_package import PACKAGE_ROOT, build_package
-    from portable_launch import build_app_command, load_config, wait_for_application
+    from portable_launch import build_app_command, build_web_setup_command, load_config, wait_for_application
 
 
 class RunningProcess:
@@ -47,6 +48,15 @@ class UnrelatedHandler(http.server.BaseHTTPRequestHandler):
 
 
 class PortableConfigTests(unittest.TestCase):
+    def test_web_setup_command_uses_the_local_picker_mode(self) -> None:
+        command = build_web_setup_command(
+            Path("/tmp/app.py"),
+            {"host": "127.0.0.1", "port": 9876},
+        )
+
+        self.assertIn("--web-setup", command)
+        self.assertEqual(command[command.index("--port") + 1], "9876")
+
     def test_relative_paths_and_options_become_app_command(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -174,6 +184,24 @@ class PortablePackageTests(unittest.TestCase):
 
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertIn(str(package_dir / "app.py"), completed.stdout)
+
+    def test_extracted_package_defaults_to_web_setup_without_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            archive, _ = build_package(root)
+            with zipfile.ZipFile(archive) as bundle:
+                bundle.extractall(root)
+            package_dir = root / PACKAGE_ROOT
+
+            completed = subprocess.run(
+                [sys.executable, str(package_dir / "portable_launch.py"), "--dry-run"],
+                capture_output=True,
+                check=False,
+                text=True,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertIn("--web-setup", completed.stdout)
 
     def test_extracted_package_app_starts_and_answers_health_endpoint(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

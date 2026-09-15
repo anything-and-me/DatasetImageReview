@@ -18,6 +18,7 @@ import json
 import mimetypes
 import os
 from pathlib import Path
+from queue import Empty, Queue
 import shutil
 import tempfile
 import threading
@@ -31,7 +32,7 @@ from PIL import Image
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
 DECISIONS = {"keep", "reject", "skip"}
 DECISION_LABELS = {"keep": "保留", "reject": "不保留", "skip": "跳过", None: "未审核"}
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 
 def utc_now() -> str:
@@ -403,6 +404,83 @@ class ReviewStore:
         }
 
 
+def empty_stats() -> dict[str, int]:
+    return {
+        "total": 0,
+        "reviewed": 0,
+        "keep": 0,
+        "reject": 0,
+        "skip": 0,
+        "unreviewed": 0,
+        "anomalies": 0,
+    }
+
+
+@dataclass
+class DirectoryRequest:
+    title: str
+    completed: threading.Event
+    selected: Path | None = None
+    error: str | None = None
+    cancelled: bool = False
+
+
+class DirectoryPicker:
+    """Open native directory dialogs on the application's main thread."""
+
+    def __init__(self) -> None:
+        self.requests: Queue[DirectoryRequest] = Queue()
+
+    def choose(self, title: str, timeout_seconds: float = 300.0) -> Path | None:
+        request = DirectoryRequest(title=title, completed=threading.Event())
+        self.requests.put(request)
+        if not request.completed.wait(timeout_seconds):
+            request.cancelled = True
+            raise ValueError("目录选择超时，请重新点击选择按钮")
+        if request.error:
+            raise ValueError(request.error)
+        return request.selected
+
+    def process_pending(self) -> None:
+        while True:
+            try:
+                request = self.requests.get_nowait()
+            except Empty:
+                return
+            if request.cancelled:
+                continue
+            try:
+                request.selected = self._show_dialog(request.title)
+            except (OSError, RuntimeError) as exc:
+                request.error = str(exc)
+            finally:
+                request.completed.set()
+
+    @staticmethod
+    def _show_dialog(title: str) -> Path | None:
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+        except ImportError as exc:
+            raise RuntimeError(
+                "当前 Python 未提供 tkinter，无法打开系统目录选择器。"
+                "请安装 tkinter 后重试，或使用 JSON/命令行配置启动。"
+            ) from exc
+        root = None
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            root.update()
+            selected = filedialog.askdirectory(parent=root, title=title, mustexist=True)
+        except tk.TclError as exc:
+            raise RuntimeError(f"无法打开系统目录选择器: {exc}") from exc
+        finally:
+            if root is not None:
+                root.destroy()
+        return canonical_path(Path(selected)) if selected else None
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -589,15 +667,26 @@ HTML_PAGE = r"""<!doctype html>
 body { margin:0; min-height:100vh; font:14px/1.45 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif; background:linear-gradient(135deg,#0b1220,#172033 55%,#111827); color:var(--text); }
 header { padding:18px 24px 10px; display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; }
 h1 { margin:0; font-size:22px; letter-spacing:.02em; }
-button, select { border:1px solid var(--line); background:var(--panel2); color:var(--text); border-radius:8px; padding:9px 13px; cursor:pointer; }
+button, select, input { border:1px solid var(--line); background:var(--panel2); color:var(--text); border-radius:8px; padding:9px 13px; }
+button { cursor:pointer; }
 button:hover { border-color:#7dd3fc; transform:translateY(-1px); }
 button.primary { background:#166534; border-color:#22c55e; }
 button.reject { background:#7f1d1d; border-color:#ef4444; }
 button:disabled { opacity:.45; cursor:not-allowed; transform:none; }
+[hidden] { display:none !important; }
 .layout { max-width:1500px; margin:auto; padding:0 24px 24px; }
 .toolbar, .stats, .info, .statusbar { background:rgba(31,41,55,.9); border:1px solid var(--line); border-radius:12px; padding:12px; }
 .toolbar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:12px; }
 .toolbar .spacer { flex:1; }
+.setup { max-width:880px; margin:35px auto; padding:24px; background:rgba(31,41,55,.94); border:1px solid var(--line); border-radius:12px; }
+.setup h2 { margin:0 0 6px; font-size:20px; }
+.setup p { color:var(--muted); margin:6px 0 18px; }
+.setup-grid { display:grid; grid-template-columns:1fr auto; gap:10px; align-items:center; }
+.setup-grid label { grid-column:1 / -1; color:var(--muted); font-size:12px; margin-top:4px; }
+.setup-grid input { min-width:0; width:100%; }
+.setup-options { display:flex; gap:12px; flex-wrap:wrap; margin:18px 0; color:var(--muted); }
+.setup-options label { display:flex; align-items:center; gap:6px; }
+.setup-options input { accent-color:var(--accent); }
 .stats { display:grid; grid-template-columns:repeat(6,minmax(100px,1fr)); gap:8px; margin-bottom:12px; }
 .stat { background:rgba(39,52,73,.75); padding:9px 12px; border-radius:8px; }
 .stat b { display:block; font-size:20px; }
@@ -621,11 +710,37 @@ button:disabled { opacity:.45; cursor:not-allowed; transform:none; }
 <body>
 <header><h1>数据集图像审核</h1><div class="help">Y/Enter 保留 · N/Delete 不保留 · ←/→ 翻页 · Z 撤销</div></header>
 <main class="layout">
+  <section class="setup" id="setupPanel" hidden>
+    <h2>选择本机文件夹</h2>
+    <p>点击按钮会打开当前电脑的系统目录选择器。路径只在本机审核服务中使用，不会上传到云端。</p>
+    <div class="setup-grid">
+      <label for="visualRoot">模型可视化图文件夹（必选）</label>
+      <input id="visualRoot" readonly placeholder="请选择包含检测框或掩码可视化图的文件夹">
+      <button data-directory="visual_root">选择文件夹</button>
+      <label for="originalRoot">原图文件夹（必选）</label>
+      <input id="originalRoot" readonly placeholder="请选择对应原始图片文件夹">
+      <button data-directory="original_root">选择文件夹</button>
+      <label for="labelRoot">YOLO 标签文件夹（可选）</label>
+      <input id="labelRoot" readonly placeholder="无标签可留空">
+      <button data-directory="label_root">选择文件夹</button>
+      <label for="outputRoot">导出数据集文件夹（必选）</label>
+      <input id="outputRoot" readonly placeholder="请选择一个已有的导出父目录">
+      <button data-directory="output_root">选择文件夹</button>
+    </div>
+    <div class="setup-options">
+      <label><input id="candidateOnly" type="checkbox"> 仅审核有模型可视化图的候选样本</label>
+      <label><input id="includeVisualizations" type="checkbox" checked> 导出可视化图</label>
+      <label><input id="allowImagesWithoutLabels" type="checkbox"> 允许导出无标签图片</label>
+    </div>
+    <button class="primary" id="configure">确认文件夹并开始审核</button>
+    <div class="statusbar" id="setupStatus">请依次选择模型图、原图和导出文件夹。</div>
+  </section>
+  <div id="reviewUi" hidden>
   <div class="toolbar">
     <label>筛选 <select id="filter"><option value="all">全部</option><option value="unreviewed">未审核</option><option value="keep">已保留</option><option value="reject">已排除</option><option value="skip">已跳过</option><option value="error">配对异常</option></select></label>
     <button id="prev">上一张</button><button id="next">下一张</button>
     <button class="primary" data-decision="keep">保留</button><button class="reject" data-decision="reject">不保留</button><button data-decision="skip">跳过</button><button id="undo">撤销</button>
-    <span class="spacer"></span><button id="zoomOut">−</button><button id="zoomReset">100%</button><button id="zoomIn">＋</button><button id="rescan">重新扫描</button><button id="export">导出数据集</button>
+    <span class="spacer"></span><button id="zoomOut">−</button><button id="zoomReset">100%</button><button id="zoomIn">＋</button><button id="chooseFolders">重新选择文件夹</button><button id="rescan">重新扫描</button><button id="export">导出数据集</button>
   </div>
   <div class="stats" id="stats"></div>
   <div class="pair">
@@ -634,10 +749,44 @@ button:disabled { opacity:.45; cursor:not-allowed; transform:none; }
   </div>
   <div class="info" id="info"></div>
   <div class="statusbar" id="status">正在加载…</div>
+  </div>
 </main>
 <script>
-const state = { records: [], decisions: {}, stats: {}, filter: "all", cursor: 0, scale: 1, detail: null };
+const state = { ready: false, records: [], decisions: {}, stats: {}, filter: "all", cursor: 0, scale: 1, detail: null };
 const $ = id => document.getElementById(id);
+const inputForDirectory = { visual_root: "visualRoot", original_root: "originalRoot", label_root: "labelRoot", output_root: "outputRoot" };
+function setSetupStatus(message, error=false) { $("setupStatus").textContent = message; $("setupStatus").style.color = error ? "#fca5a5" : "#bfdbfe"; }
+function showSetup(message="请选择文件夹后开始审核。") {
+  $("setupPanel").hidden = false; $("reviewUi").hidden = true; setSetupStatus(message);
+}
+function showReview() { $("setupPanel").hidden = true; $("reviewUi").hidden = false; }
+function fillSetup(config) {
+  for (const [field, id] of Object.entries(inputForDirectory)) {
+    if (config && config[field]) $(id).value = config[field];
+  }
+}
+async function chooseDirectory(field) {
+  setSetupStatus("正在打开系统目录选择器，请在弹出的窗口中选择文件夹…");
+  const response = await fetch("/api/select-directory", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({field})});
+  const payload = await response.json();
+  if (!response.ok) { setSetupStatus(payload.error || "无法打开目录选择器", true); return; }
+  if (!payload.path) { setSetupStatus("未选择文件夹。"); return; }
+  $(inputForDirectory[field]).value = payload.path;
+  setSetupStatus(`已选择：${payload.path}`);
+}
+async function configureReview() {
+  const visualRoot = $("visualRoot").value, originalRoot = $("originalRoot").value, outputRoot = $("outputRoot").value;
+  if (!visualRoot || !originalRoot || !outputRoot) { setSetupStatus("请先选择模型图、原图和导出文件夹。", true); return; }
+  setSetupStatus("正在扫描并建立审核列表…");
+  const response = await fetch("/api/configure", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({
+    visual_root: visualRoot, original_root: originalRoot, label_root: $("labelRoot").value || null, output_root: outputRoot,
+    candidate_only: $("candidateOnly").checked, include_visualizations: $("includeVisualizations").checked,
+    allow_images_without_labels: $("allowImagesWithoutLabels").checked
+  })});
+  const payload = await response.json();
+  if (!response.ok) { setSetupStatus(payload.error || "配置失败", true); return; }
+  state.cursor = 0; await reload(payload);
+}
 function currentList() {
   return state.records.filter(r => {
     const d = state.decisions[r.sample_id];
@@ -694,10 +843,14 @@ async function render() {
   ].map(([k,v]) => `<div><div class="label">${k}</div><div class="value">${v}</div></div>`).join("");
   setStatus(`当前：${record.visual_rel || record.original_rel} · ${d} · 缩放 ${Math.round(state.scale*100)}%`);
 }
-async function reload() {
-  const response = await fetch("/api/state");
-  if (!response.ok) { setStatus("加载状态失败", true); return; }
-  const payload = await response.json();
+async function reload(existingPayload=null) {
+  const response = existingPayload ? null : await fetch("/api/state");
+  if (!existingPayload && !response.ok) { setStatus("加载状态失败", true); return; }
+  const payload = existingPayload || await response.json();
+  state.ready = !!payload.ready;
+  fillSetup(payload.config);
+  if (!state.ready) { showSetup(); return; }
+  showReview();
   state.records = payload.records; state.decisions = payload.decisions; state.stats = payload.stats;
   const list = currentList(); if (state.cursor >= list.length) state.cursor = Math.max(0, list.length - 1);
   await render();
@@ -724,9 +877,12 @@ async function exportData() {
   setStatus(`导出完成：${payload.exported} 个样本；冲突 ${payload.conflicts.length}；问题 ${payload.issues.length}`);
 }
 document.querySelectorAll("[data-decision]").forEach(button => button.onclick = () => decide(button.dataset.decision));
+document.querySelectorAll("[data-directory]").forEach(button => button.onclick = () => chooseDirectory(button.dataset.directory));
+$("configure").onclick = configureReview;
 $("prev").onclick = () => { state.cursor = Math.max(0, state.cursor - 1); render(); };
 $("next").onclick = () => { state.cursor = Math.min(currentList().length - 1, state.cursor + 1); render(); };
 $("undo").onclick = undo; $("export").onclick = exportData;
+$("chooseFolders").onclick = () => showSetup("重新选择并确认文件夹会切换到新的审核会话；源文件不会被修改。");
 $("rescan").onclick = async () => {
   const response = await fetch("/api/rescan", {method:"POST"});
   if (!response.ok) { setStatus("重新扫描失败", true); return; }
@@ -756,57 +912,132 @@ reload();
 class ReviewApplication:
     def __init__(
         self,
-        engine: PairingEngine,
-        store: ReviewStore,
-        output_root: Path,
+        engine: PairingEngine | None = None,
+        store: ReviewStore | None = None,
+        output_root: Path | None = None,
         include_visualizations: bool = True,
         allow_images_without_labels: bool = False,
         instance_id: str | None = None,
     ) -> None:
+        if (engine is None) != (store is None) or (engine is None) != (output_root is None):
+            raise ValueError("engine、store 和 output_root 必须同时提供，或全部留空以使用网页选目录模式")
         self.engine = engine
         self.store = store
-        self.output_root = canonical_path(output_root)
+        self.output_root = canonical_path(output_root) if output_root is not None else None
         self.include_visualizations = include_visualizations
         self.allow_images_without_labels = allow_images_without_labels
         self.instance_id = instance_id or uuid.uuid4().hex
         self.lock = threading.RLock()
-        self.records = self.engine.scan()
+        self.records = self.engine.scan() if self.engine is not None else []
+
+    @property
+    def ready(self) -> bool:
+        return self.engine is not None and self.store is not None and self.output_root is not None
+
+    def require_ready(self) -> tuple[PairingEngine, ReviewStore, Path]:
+        if not self.ready:
+            raise ValueError("请先在网页中选择并确认文件夹")
+        assert self.engine is not None
+        assert self.store is not None
+        assert self.output_root is not None
+        return self.engine, self.store, self.output_root
+
+    def configure_from_directories(
+        self,
+        visual_root: Path,
+        original_root: Path,
+        output_root: Path,
+        label_root: Path | None = None,
+        manifest_path: Path | None = None,
+        candidate_only: bool = False,
+        include_visualizations: bool = True,
+        allow_images_without_labels: bool = False,
+    ) -> None:
+        visual_root = canonical_path(visual_root)
+        original_root = canonical_path(original_root)
+        output_root = canonical_path(output_root)
+        label_root = canonical_path(label_root) if label_root is not None else None
+        manifest_path = canonical_path(manifest_path) if manifest_path is not None else None
+        for name, path in (("可视化图文件夹", visual_root), ("原图文件夹", original_root)):
+            if not path.is_dir():
+                raise ValueError(f"{name}不存在或不是目录: {path}")
+        if label_root is not None and not label_root.is_dir():
+            raise ValueError(f"标签文件夹不存在或不是目录: {label_root}")
+        if manifest_path is not None and not manifest_path.is_file():
+            raise ValueError(f"配对清单不存在或不是文件: {manifest_path}")
+
+        engine = PairingEngine(
+            visual_root,
+            original_root,
+            label_root,
+            manifest_path,
+            include_original_only=not candidate_only,
+        )
+        records = engine.scan()
+        store = ReviewStore(output_root / ".review_state.json")
+        with self.lock:
+            self.engine = engine
+            self.store = store
+            self.output_root = output_root
+            self.include_visualizations = include_visualizations
+            self.allow_images_without_labels = allow_images_without_labels
+            self.records = records
 
     def rescan(self) -> None:
+        engine, _, _ = self.require_ready()
         with self.lock:
-            self.records = self.engine.scan()
+            self.records = engine.scan()
 
     def set_decision(self, sample_id: str, decision: str) -> None:
+        _, store, _ = self.require_ready()
         with self.lock:
             record = next((item for item in self.records if item.sample_id == sample_id), None)
             if record is None:
                 raise ValueError("sample not found")
             if decision == "keep" and (record.original_path is None or not record.original_path.is_file()):
                 raise ValueError("缺失原图的样本不能保留")
-            self.store.set_decision(sample_id, decision)
+            store.set_decision(sample_id, decision)
 
     def state_payload(self) -> dict[str, Any]:
         with self.lock:
+            if not self.ready:
+                return {
+                    "app_version": APP_VERSION,
+                    "instance_id": self.instance_id,
+                    "ready": False,
+                    "records": [],
+                    "decisions": {},
+                    "stats": empty_stats(),
+                    "config": {
+                        "visual_root": None,
+                        "original_root": None,
+                        "label_root": None,
+                        "output_root": None,
+                    },
+                }
+            engine, store, output_root = self.require_ready()
             return {
                 "app_version": APP_VERSION,
                 "instance_id": self.instance_id,
-                "records": [record.to_dict(self.store.decisions.get(record.sample_id)) for record in self.records],
-                "decisions": dict(self.store.decisions),
-                "stats": self.store.stats(self.records),
+                "ready": True,
+                "records": [record.to_dict(store.decisions.get(record.sample_id)) for record in self.records],
+                "decisions": dict(store.decisions),
+                "stats": store.stats(self.records),
                 "config": {
-                    "visual_root": str(self.engine.visual_root),
-                    "original_root": str(self.engine.original_root),
-                    "label_root": str(self.engine.label_root) if self.engine.label_root else None,
-                    "output_root": str(self.output_root),
+                    "visual_root": str(engine.visual_root),
+                    "original_root": str(engine.original_root),
+                    "label_root": str(engine.label_root) if engine.label_root else None,
+                    "output_root": str(output_root),
                 },
             }
 
     def detail(self, sample_id: str) -> dict[str, Any] | None:
+        _, store, _ = self.require_ready()
         with self.lock:
             for record in self.records:
                 if record.sample_id == sample_id:
                     return {
-                        **record.to_dict(self.store.decisions.get(sample_id)),
+                        **record.to_dict(store.decisions.get(sample_id)),
                         "visual_dimensions": read_dimensions(record.visual_path),
                         "original_dimensions": read_dimensions(record.original_path),
                     }
@@ -875,7 +1106,11 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
         if len(parts) != 4 or parts[2] not in {"visual", "original"}:
             self.send_json({"error": "not found"}, 404)
             return
-        root = self.application.engine.visual_root if parts[2] == "visual" else self.application.engine.original_root
+        if not self.application.ready:
+            self.send_json({"error": "请先在网页中选择并确认文件夹"}, 409)
+            return
+        engine, _, _ = self.application.require_ready()
+        root = engine.visual_root if parts[2] == "visual" else engine.original_root
         relative = Path(parts[3])
         file_path = (root / relative).resolve()
         if not is_inside(file_path, root) or not file_path.is_file() or file_path.suffix.lower() not in IMAGE_SUFFIXES:
@@ -897,33 +1132,76 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
         try:
+            if parsed.path == "/api/select-directory":
+                payload = self.read_json()
+                selected = self.server.select_directory(str(payload["field"]))  # type: ignore[attr-defined]
+                self.send_json({"path": str(selected) if selected is not None else None})
+                return
+            if parsed.path == "/api/configure":
+                payload = self.read_json()
+
+                def required_path(key: str) -> Path:
+                    value = payload.get(key)
+                    if not isinstance(value, str) or not value.strip():
+                        raise ValueError(f"{key} 必须是非空目录路径")
+                    return Path(value)
+
+                def optional_path(key: str) -> Path | None:
+                    value = payload.get(key)
+                    if value in (None, ""):
+                        return None
+                    if not isinstance(value, str):
+                        raise ValueError(f"{key} 必须是目录路径或 null")
+                    return Path(value)
+
+                def boolean(key: str, default: bool) -> bool:
+                    value = payload.get(key, default)
+                    if not isinstance(value, bool):
+                        raise ValueError(f"{key} 必须是 true 或 false")
+                    return value
+
+                self.application.configure_from_directories(
+                    required_path("visual_root"),
+                    required_path("original_root"),
+                    required_path("output_root"),
+                    label_root=optional_path("label_root"),
+                    manifest_path=optional_path("manifest"),
+                    candidate_only=boolean("candidate_only", False),
+                    include_visualizations=boolean("include_visualizations", True),
+                    allow_images_without_labels=boolean("allow_images_without_labels", False),
+                )
+                self.send_json(self.application.state_payload())
+                return
             if parsed.path == "/api/decision":
                 payload = self.read_json()
                 self.application.set_decision(str(payload["sample_id"]), str(payload["decision"]))
+                _, store, _ = self.application.require_ready()
                 self.send_json(
                     {
-                        "decisions": dict(self.application.store.decisions),
-                        "stats": self.application.store.stats(self.application.records),
+                        "decisions": dict(store.decisions),
+                        "stats": store.stats(self.application.records),
                     }
                 )
                 return
             if parsed.path == "/api/undo":
-                sample_id = self.application.store.undo()
+                _, store, _ = self.application.require_ready()
+                sample_id = store.undo()
                 self.send_json(
                     {
                         "sample_id": sample_id,
-                        "decisions": dict(self.application.store.decisions),
-                        "stats": self.application.store.stats(self.application.records),
+                        "decisions": dict(store.decisions),
+                        "stats": store.stats(self.application.records),
                     }
                 )
                 return
             if parsed.path == "/api/export":
+                engine, store, output_root = self.application.require_ready()
                 summary = export_dataset(
                     self.application.records,
-                    self.application.store,
-                    self.application.output_root,
+                    store,
+                    output_root,
                     include_visualizations=self.application.include_visualizations,
-                    require_labels=self.application.engine.label_root is not None,
+                    require_labels=engine.label_root is not None,
                     allow_images_without_labels=self.application.allow_images_without_labels,
                 )
                 self.send_json(summary)
@@ -942,16 +1220,31 @@ class ReviewServer(http.server.ThreadingHTTPServer):
 
     def __init__(self, address: tuple[str, int], application: ReviewApplication):
         self.application = application
+        self.directory_picker = DirectoryPicker()
         super().__init__(address, RequestHandler)
+
+    def select_directory(self, field: str) -> Path | None:
+        titles = {
+            "visual_root": "选择模型可视化图文件夹",
+            "original_root": "选择原图文件夹",
+            "label_root": "选择 YOLO 标签文件夹（可取消）",
+            "output_root": "选择导出数据集文件夹",
+        }
+        if field not in titles:
+            raise ValueError("未知目录选择项")
+        return self.directory_picker.choose(titles[field])
+
+    def process_directory_requests(self) -> None:
+        self.directory_picker.process_pending()
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--visual-root", type=Path, required=True, help="模型可视化图片目录")
-    parser.add_argument("--original-root", type=Path, required=True, help="原始图片目录")
+    parser.add_argument("--visual-root", type=Path, default=None, help="模型可视化图片目录")
+    parser.add_argument("--original-root", type=Path, default=None, help="原始图片目录")
     parser.add_argument("--label-root", type=Path, default=None, help="可选 YOLO 标签目录")
     parser.add_argument("--manifest", type=Path, default=None, help="可选 CSV/JSON/JSONL 显式配对清单")
-    parser.add_argument("--output-root", type=Path, required=True, help="导出数据集目录")
+    parser.add_argument("--output-root", type=Path, default=None, help="导出数据集目录")
     parser.add_argument("--state-file", type=Path, default=None, help="审核状态 JSON；默认写入 output-root/.review_state.json")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
@@ -962,44 +1255,69 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="仅以模型可视化图为审核候选；不列出缺少可视化图的原图",
     )
+    parser.add_argument(
+        "--web-setup",
+        action="store_true",
+        help="启动后通过网页中的系统文件夹选择器设置输入和导出目录",
+    )
     parser.add_argument("--instance-id", default=None, help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    if not args.visual_root.is_dir():
-        raise SystemExit(f"visual-root 不存在或不是目录: {args.visual_root}")
-    if not args.original_root.is_dir():
-        raise SystemExit(f"original-root 不存在或不是目录: {args.original_root}")
-    if args.label_root and not args.label_root.is_dir():
-        raise SystemExit(f"label-root 不存在或不是目录: {args.label_root}")
-    state_file = args.state_file or (args.output_root / ".review_state.json")
-    engine = PairingEngine(
-        args.visual_root,
-        args.original_root,
-        args.label_root,
-        args.manifest,
-        include_original_only=not args.candidate_only,
-    )
     try:
-        store = ReviewStore(state_file)
-        application = ReviewApplication(
-            engine,
-            store,
-            args.output_root,
-            include_visualizations=not args.no_visualizations,
-            allow_images_without_labels=args.allow_images_without_labels,
-            instance_id=args.instance_id,
-        )
+        configured_roots = (args.visual_root, args.original_root, args.output_root)
+        if args.web_setup:
+            if args.host != "127.0.0.1":
+                raise ValueError("网页文件夹选择模式仅允许监听 127.0.0.1")
+            application = ReviewApplication(instance_id=args.instance_id)
+        else:
+            if any(path is None for path in configured_roots):
+                raise ValueError(
+                    "visual-root、original-root 和 output-root 必须同时提供；"
+                    "或使用 --web-setup 在网页中选择文件夹"
+                )
+            assert args.visual_root is not None
+            assert args.original_root is not None
+            assert args.output_root is not None
+            if not args.visual_root.is_dir():
+                raise ValueError(f"visual-root 不存在或不是目录: {args.visual_root}")
+            if not args.original_root.is_dir():
+                raise ValueError(f"original-root 不存在或不是目录: {args.original_root}")
+            if args.label_root and not args.label_root.is_dir():
+                raise ValueError(f"label-root 不存在或不是目录: {args.label_root}")
+            state_file = args.state_file or (args.output_root / ".review_state.json")
+            engine = PairingEngine(
+                args.visual_root,
+                args.original_root,
+                args.label_root,
+                args.manifest,
+                include_original_only=not args.candidate_only,
+            )
+            application = ReviewApplication(
+                engine,
+                ReviewStore(state_file),
+                args.output_root,
+                include_visualizations=not args.no_visualizations,
+                allow_images_without_labels=args.allow_images_without_labels,
+                instance_id=args.instance_id,
+            )
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         raise SystemExit(str(exc)) from exc
     server = ReviewServer((args.host, args.port), application)
     print(f"数据集图像审核工具已启动: http://{args.host}:{args.port}", flush=True)
-    print(f"配对样本: {len(application.records)}; 状态文件: {store.path}", flush=True)
+    if application.ready:
+        _, store, _ = application.require_ready()
+        print(f"配对样本: {len(application.records)}; 状态文件: {store.path}", flush=True)
+    else:
+        print("请在浏览器中点击“选择文件夹”，完成配置后开始审核。", flush=True)
     print("按 Ctrl+C 停止。源文件只读，导出操作只复制保留样本。", flush=True)
     try:
-        server.serve_forever()
+        server.timeout = 0.2
+        while True:
+            server.handle_request()
+            server.process_directory_requests()
     except KeyboardInterrupt:
         print("\n已停止。", flush=True)
     finally:

@@ -1,15 +1,23 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
 try:
-    from tools.dataset_image_review.app import PairingEngine, ReviewApplication, ReviewStore, export_dataset
+    from tools.dataset_image_review.app import (
+        PairingEngine,
+        ReviewApplication,
+        ReviewServer,
+        ReviewStore,
+        export_dataset,
+    )
 except ModuleNotFoundError:
-    from app import PairingEngine, ReviewApplication, ReviewStore, export_dataset
+    from app import PairingEngine, ReviewApplication, ReviewServer, ReviewStore, export_dataset
 
 
 def write_file(path: Path, data: bytes = b"image") -> None:
@@ -220,6 +228,90 @@ class PersistenceAndExportTests(unittest.TestCase):
                 (output / "labels" / "keep.txt").read_bytes(),
                 b"0 0.2 0.2 0.1 0.1\n",
             )
+
+
+class WebSetupTests(unittest.TestCase):
+    def test_unconfigured_application_can_configure_selected_folders(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            visual = root / "visual"
+            original = root / "original"
+            output = root / "export"
+            write_file(visual / "scene" / "frame.jpg", b"visual")
+            write_file(original / "scene" / "frame.jpg", b"original")
+
+            application = ReviewApplication()
+
+            self.assertFalse(application.state_payload()["ready"])
+            application.configure_from_directories(visual, original, output)
+            payload = application.state_payload()
+
+            self.assertTrue(payload["ready"])
+            self.assertEqual(payload["config"]["visual_root"], str(visual.resolve()))
+            self.assertEqual(payload["config"]["original_root"], str(original.resolve()))
+            self.assertEqual(len(payload["records"]), 1)
+
+    def test_web_configure_endpoint_initializes_the_reviewer(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            visual = root / "visual"
+            original = root / "original"
+            output = root / "export"
+            write_file(visual / "frame.jpg", b"visual")
+            write_file(original / "frame.jpg", b"original")
+
+            server = ReviewServer(("127.0.0.1", 0), ReviewApplication())
+            server.timeout = 0.05
+            stop = threading.Event()
+
+            def serve_web_setup() -> None:
+                while not stop.is_set():
+                    server.handle_request()
+                    server.process_directory_requests()
+
+            server.directory_picker._show_dialog = lambda title: visual  # type: ignore[method-assign]
+            worker = threading.Thread(target=serve_web_setup, daemon=True)
+            worker.start()
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+            try:
+                connection.request("GET", "/api/state")
+                initial = connection.getresponse()
+                self.assertEqual(initial.status, 200)
+                self.assertFalse(json.loads(initial.read())["ready"])
+
+                connection.request(
+                    "POST",
+                    "/api/select-directory",
+                    body=json.dumps({"field": "visual_root"}),
+                    headers={"Content-Type": "application/json"},
+                )
+                selected_response = connection.getresponse()
+                selected_payload = json.loads(selected_response.read())
+                self.assertEqual(selected_response.status, 200)
+                self.assertEqual(selected_payload["path"], str(visual.resolve()))
+
+                request = {
+                    "visual_root": str(visual),
+                    "original_root": str(original),
+                    "output_root": str(output),
+                }
+                connection.request(
+                    "POST",
+                    "/api/configure",
+                    body=json.dumps(request),
+                    headers={"Content-Type": "application/json"},
+                )
+                response = connection.getresponse()
+                payload = json.loads(response.read())
+
+                self.assertEqual(response.status, 200)
+                self.assertTrue(payload["ready"])
+                self.assertEqual(len(payload["records"]), 1)
+            finally:
+                connection.close()
+                stop.set()
+                server.server_close()
+                worker.join(timeout=5)
 
 
 if __name__ == "__main__":

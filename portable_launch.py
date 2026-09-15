@@ -119,6 +119,19 @@ def build_app_command(app_path: Path, config: dict[str, Any]) -> list[str]:
     return command
 
 
+def build_web_setup_command(app_path: Path, config: dict[str, Any]) -> list[str]:
+    """Start the application without paths so the browser can select folders."""
+    return [
+        sys.executable,
+        str(app_path.resolve()),
+        "--web-setup",
+        "--host",
+        config["host"],
+        "--port",
+        str(config["port"]),
+    ]
+
+
 def is_reviewer_healthy(host: str, port: int, expected_instance_id: str | None = None) -> bool:
     try:
         connection = http.client.HTTPConnection(host, port, timeout=0.5)
@@ -171,6 +184,7 @@ def parse_args() -> argparse.Namespace:
     package_dir = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=package_dir / "config.json")
+    parser.add_argument("--web-setup", action="store_true", help="在网页中选择本机文件夹，不读取 config.json")
     parser.add_argument("--no-browser", action="store_true", help="不自动打开本地浏览器")
     parser.add_argument("--dry-run", action="store_true", help="仅显示将要执行的应用命令")
     return parser.parse_args()
@@ -181,12 +195,21 @@ def main() -> int:
         print("需要 Python 3.10 或更高版本。", file=sys.stderr)
         return 2
     args = parse_args()
-    try:
-        config = load_config(args.config)
-    except ValueError as exc:
-        print(str(exc), file=sys.stderr)
-        return 2
-    command = build_app_command(Path(__file__).resolve().with_name("app.py"), config)
+    default_config = Path(__file__).resolve().with_name("config.json")
+    if args.web_setup:
+        config: dict[str, Any] = dict(DEFAULTS)
+        command = build_web_setup_command(Path(__file__).resolve().with_name("app.py"), config)
+    else:
+        try:
+            config = load_config(args.config)
+            command = build_app_command(Path(__file__).resolve().with_name("app.py"), config)
+        except ValueError as exc:
+            if args.config.expanduser().resolve() != default_config or default_config.is_file():
+                print(str(exc), file=sys.stderr)
+                return 2
+            config = dict(DEFAULTS)
+            command = build_web_setup_command(Path(__file__).resolve().with_name("app.py"), config)
+            print("未找到 config.json，已进入网页文件夹选择模式。", flush=True)
     if args.dry_run:
         print(shlex.join(command))
         return 0

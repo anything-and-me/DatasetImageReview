@@ -22,17 +22,6 @@
 ```bash
 git clone https://github.com/anything-and-me/DatasetImageReview.git
 cd DatasetImageReview
-cp config.example.json config.json
-```
-
-编辑 `config.json`，至少填写：
-
-```json
-{
-  "visual_root": "/path/to/model-visualizations",
-  "original_root": "/path/to/original-images",
-  "output_root": "/path/to/review-export"
-}
 ```
 
 然后启动：
@@ -41,21 +30,32 @@ cp config.example.json config.json
 - Ubuntu / macOS：执行 `bash run_unix.sh`
 
 首次启动会在项目目录创建 `.venv` 并安装 Pillow，不会向系统 Python 安装依赖。
-服务就绪后浏览器会打开本机地址；按 `Ctrl+C` 停止。
+服务就绪后浏览器会打开本机地址。首次没有 `config.json` 时，页面会提供四个
+“选择文件夹”按钮，依次选择模型可视化图、原图、可选标签和导出目录，再点击
+“确认文件夹并开始审核”。目录选择器是本机系统窗口，路径不会发送到云端；按
+`Ctrl+C` 停止服务。
 
-## 配置
+## 网页选定文件夹
 
-`config.json` 相对路径以配置文件所在目录为基准。完整字段见
-[`config.example.json`](config.example.json)：
+网页选择模式依赖 Python 自带的 `tkinter` 打开系统目录选择器：
 
-- `visual_root`：模型生成的可视化图目录；
-- `original_root`：对应原始图片目录；
-- `label_root`：可选 YOLO 标签目录，未使用时为 `null`；
-- `output_root`：审核导出目录；
-- `manifest`：可选显式配对清单；
-- `candidate_only`：为 `true` 时仅审核存在模型图的候选样本；
-- `include_visualizations`：导出时是否保留模型可视化图；
-- `allow_images_without_labels`：是否允许仅导出图片；
+- Windows 和 python.org / Homebrew 的 macOS Python 通常已包含它；
+- Ubuntu 如提示缺少 `tkinter`，安装与当前 Python 版本对应的 `python3-tk` 后重启；
+- 无法使用图形目录选择器的无桌面环境，可继续使用下方 JSON 配置模式。
+
+每次点击“重新选择文件夹”后，只有再次确认才会切换审核会话。切换不会移动、删除或
+修改任何原始图片、标签或模型可视化图。
+
+## JSON / 命令行配置（兼容模式）
+
+如需使用显式配对清单、自动化启动或无图形环境，可复制
+[`config.example.json`](config.example.json) 为 `config.json`。相对路径以配置文件所在
+目录为基准。完整字段：
+
+- `visual_root`、`original_root`、`output_root`：必填目录；
+- `label_root`：可选 YOLO 标签目录；
+- `manifest`：可选 CSV/JSON/JSONL/NDJSON 显式配对清单；
+- `candidate_only`、`include_visualizations`、`allow_images_without_labels`：审核与导出选项；
 - `port`：本机端口，默认 `8765`。
 
 ## 审核与导出
@@ -101,6 +101,7 @@ python3 -m unittest discover -s . -p 'test_*.py' -v
 
 - 项目不包含示例图片、模型权重、标签、审核状态、真实路径、访问令牌或密钥；
 - 不提供远程访问、认证或多用户协作；
+- 网页目录选择器需要在运行审核服务的本机桌面会话中使用，不能从远程浏览器操作；
 - 审核工具不编辑模型框或自动修正标签，导出的标签保持原样。
 
 ## License
