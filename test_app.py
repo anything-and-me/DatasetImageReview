@@ -249,6 +249,8 @@ class WebSetupTests(unittest.TestCase):
             self.assertTrue(payload["ready"])
             self.assertEqual(payload["config"]["visual_root"], str(visual.resolve()))
             self.assertEqual(payload["config"]["original_root"], str(original.resolve()))
+            self.assertFalse(payload["config"]["candidate_only"])
+            self.assertTrue(payload["config"]["include_visualizations"])
             self.assertEqual(len(payload["records"]), 1)
 
     def test_web_configure_endpoint_initializes_the_reviewer(self) -> None:

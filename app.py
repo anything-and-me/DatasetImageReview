@@ -764,6 +764,11 @@ function fillSetup(config) {
   for (const [field, id] of Object.entries(inputForDirectory)) {
     if (config && config[field]) $(id).value = config[field];
   }
+  if (config) {
+    $("candidateOnly").checked = !!config.candidate_only;
+    $("includeVisualizations").checked = config.include_visualizations !== false;
+    $("allowImagesWithoutLabels").checked = !!config.allow_images_without_labels;
+  }
 }
 async function chooseDirectory(field) {
   setSetupStatus("正在打开系统目录选择器，请在弹出的窗口中选择文件夹…");
@@ -917,6 +922,7 @@ class ReviewApplication:
         output_root: Path | None = None,
         include_visualizations: bool = True,
         allow_images_without_labels: bool = False,
+        candidate_only: bool = False,
         instance_id: str | None = None,
     ) -> None:
         if (engine is None) != (store is None) or (engine is None) != (output_root is None):
@@ -926,6 +932,7 @@ class ReviewApplication:
         self.output_root = canonical_path(output_root) if output_root is not None else None
         self.include_visualizations = include_visualizations
         self.allow_images_without_labels = allow_images_without_labels
+        self.candidate_only = candidate_only
         self.instance_id = instance_id or uuid.uuid4().hex
         self.lock = threading.RLock()
         self.records = self.engine.scan() if self.engine is not None else []
@@ -981,6 +988,7 @@ class ReviewApplication:
             self.output_root = output_root
             self.include_visualizations = include_visualizations
             self.allow_images_without_labels = allow_images_without_labels
+            self.candidate_only = candidate_only
             self.records = records
 
     def rescan(self) -> None:
@@ -1013,6 +1021,9 @@ class ReviewApplication:
                         "original_root": None,
                         "label_root": None,
                         "output_root": None,
+                        "candidate_only": self.candidate_only,
+                        "include_visualizations": self.include_visualizations,
+                        "allow_images_without_labels": self.allow_images_without_labels,
                     },
                 }
             engine, store, output_root = self.require_ready()
@@ -1028,6 +1039,9 @@ class ReviewApplication:
                     "original_root": str(engine.original_root),
                     "label_root": str(engine.label_root) if engine.label_root else None,
                     "output_root": str(output_root),
+                    "candidate_only": self.candidate_only,
+                    "include_visualizations": self.include_visualizations,
+                    "allow_images_without_labels": self.allow_images_without_labels,
                 },
             }
 
@@ -1301,6 +1315,7 @@ def main() -> int:
                 args.output_root,
                 include_visualizations=not args.no_visualizations,
                 allow_images_without_labels=args.allow_images_without_labels,
+                candidate_only=args.candidate_only,
                 instance_id=args.instance_id,
             )
     except (OSError, ValueError, json.JSONDecodeError) as exc:
